@@ -2,6 +2,8 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 
+#include "matmul_config.h"
+
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -11,13 +13,6 @@
 #endif
 
 namespace wmma = nvcuda::wmma;
-
-constexpr int kBlockM = 16;
-constexpr int kBlockN = 32;
-// Contraction Dimension
-constexpr int kTileK = 16;
-constexpr int kThreads = 64;
-constexpr int kWarpSize = 32;
 
 __global__ void tiled_matmul(const __half* Q, const __half* K, float* S, int M, int N, int d, const uint64_t* routing_words) {
 
@@ -32,7 +27,7 @@ __global__ void tiled_matmul(const __half* Q, const __half* K, float* S, int M, 
     extern __shared__ __align__(32) unsigned char shared_storage[];
     __half* Q_tile = reinterpret_cast<__half*>(shared_storage);
     __half* K_tile = Q_tile + kBlockM * padded_d;
-    float* S_tile = reinterpret_cast<float*>(K_tile + kBlockN * padded_d)
+    float* S_tile = reinterpret_cast<float*>(K_tile + kBlockN * padded_d);
 
     const int thread = threadIdx.x;
     const int warp = thread / kWarpSize;
@@ -42,12 +37,12 @@ __global__ void tiled_matmul(const __half* Q, const __half* K, float* S, int M, 
     const uint64_t routing_word = routing_words[blockIdx.x];
 
     // Load Q tile
-    for (int index = thread; index < kBlockM * padded_d; index += k_threads) {
+    for (int index = thread; index < kBlockM * padded_d; index += kThreads) {
         const int local_query = index / padded_d;
         const int feature = index % padded_d;
         const int query = query_begin + local_query;
-        Q_tile[index] = query < M ? 
-                        Q[static_cast<size_t>local_query * padded_d + feature]
+        Q_tile[index] = query < M && feature < d ?
+                        Q[static_cast<size_t>(query) * d + feature]
                         : __float2half(0.0f);
     }
     __syncthreads();

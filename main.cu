@@ -1,6 +1,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include "matmul_config.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -48,19 +50,18 @@ int main() {
     constexpr int N = 1003;
     constexpr int d = 128;
     constexpr int iterations = 100;
-    constexpr int block_M = 16;
-    constexpr int block_N = 32;
-    constexpr int threads = 256;
-
     static_assert(M > 0 && N > 0 && d > 0 && iterations > 0);
-    static_assert(N <= 64 * block_N);
+    static_assert(N <= 64 * kBlockN);
 
     const size_t Q_bytes = static_cast<size_t>(M) * d * sizeof(__half);
     const size_t K_bytes = static_cast<size_t>(N) * d * sizeof(__half);
     const size_t S_bytes = static_cast<size_t>(M) * N * sizeof(float);
-    const size_t shared_bytes = sizeof(__half) * static_cast<size_t>(d) *
-                                (block_M + block_N + 1);
-    const int query_tile_count = (M + block_M - 1) / block_M;
+    constexpr int padded_d = ((d + kTileK - 1) / kTileK) * kTileK;
+    // Shared FP16 Q/K tiles followed by the FP32 score tile.
+    const size_t shared_bytes = sizeof(__half) * static_cast<size_t>(padded_d) *
+                                (kBlockM + kBlockN) +
+                                sizeof(float) * kBlockM * kBlockN;
+    const int query_tile_count = (M + kBlockM - 1) / kBlockM;
     const size_t routing_bytes = static_cast<size_t>(query_tile_count) * sizeof(uint64_t);
 
     int device = 0;
@@ -110,7 +111,7 @@ int main() {
     CUDA_CHECK(cudaMemcpy(device_routing_words, routing_words.data(),
                           routing_bytes, cudaMemcpyHostToDevice));
 
-    const dim3 block(threads);
+    const dim3 block(kThreads);
     const dim3 grid(query_tile_count);
 
     tiled_matmul<<<grid, block, shared_bytes>>>(

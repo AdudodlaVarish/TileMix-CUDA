@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "compilerPath": "${env:HOME}/.local/cuda-13.4.3/bin/nvcc",
+            "compilerArgs": ["-std=c++17", "-arch=sm_80"],
+            "includePath": [
+                "${workspaceFolder}",
+                "${env:HOME}/.local/cuda-13.4.3/include"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
