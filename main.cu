@@ -1,15 +1,18 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
-__global__ void tiled_matmul(const float* A,
-                             const float* B,
-                             float* C,
+__global__ void tiled_matmul(const __half* Q,
+                             const __half* K,
+                             float* S,
                              int M,
                              int N,
-                             int K);
+                             int d,
+                             const uint64_t* routing_words);
 
 #define CUDA_CHECK(call)                                                \
     do {                                                                \
@@ -20,101 +23,133 @@ __global__ void tiled_matmul(const float* A,
             return 1;                                                   \
         }                                                               \
     } while (0)
-
-void reference_matmul(const float* A,
-                      const float* B,
-                      float* C,
+ 
+// Baseline
+void reference_matmul(const __half* Q,
+                      const __half* K,
+                      float* S,
                       int M,
                       int N,
-                      int K) {
+                      int d) {
     for (int row = 0; row < M; ++row) {
         for (int col = 0; col < N; ++col) {
             double sum = 0.0;
-            for (int k = 0; k < K; ++k) {
-                sum += static_cast<double>(A[row * K + k]) *
-                       static_cast<double>(B[k * N + col]);
+            for (int feature = 0; feature < d; ++feature) {
+                sum += static_cast<double>(__half2float(Q[static_cast<size_t>(row) * d + feature])) *
+                       static_cast<double>(__half2float(K[static_cast<size_t>(col) * d + feature]));
             }
-            C[row * N + col] = static_cast<float>(sum);
+            S[static_cast<size_t>(row) * N + col] = static_cast<float>(sum);
         }
     }
 }
 
 int main() {
-    // Deliberately not divisible by 16, exercising partial edge tiles.
     constexpr int M = 1000;
     constexpr int N = 1003;
-    constexpr int K = 997;
+    constexpr int d = 128;
     constexpr int iterations = 100;
+    constexpr int block_M = 16;
+    constexpr int block_N = 32;
+    constexpr int threads = 256;
 
-    const size_t A_bytes = static_cast<size_t>(M) * K * sizeof(float);
-    const size_t B_bytes = static_cast<size_t>(K) * N * sizeof(float);
-    const size_t C_bytes = static_cast<size_t>(M) * N * sizeof(float);
+    static_assert(M > 0 && N > 0 && d > 0 && iterations > 0);
+    static_assert(N <= 64 * block_N);
 
-    std::vector<float> A(static_cast<size_t>(M) * K);
-    std::vector<float> B(static_cast<size_t>(K) * N);
-    std::vector<float> C(static_cast<size_t>(M) * N);
-    std::vector<float> reference_C(static_cast<size_t>(M) * N);
+    const size_t Q_bytes = static_cast<size_t>(M) * d * sizeof(__half);
+    const size_t K_bytes = static_cast<size_t>(N) * d * sizeof(__half);
+    const size_t S_bytes = static_cast<size_t>(M) * N * sizeof(float);
+    const size_t shared_bytes = sizeof(__half) * static_cast<size_t>(d) *
+                                (block_M + block_N + 1);
+    const int query_tile_count = (M + block_M - 1) / block_M;
+    const size_t routing_bytes = static_cast<size_t>(query_tile_count) * sizeof(uint64_t);
 
-    for (size_t i = 0; i < A.size(); ++i) {
-        A[i] = static_cast<float>(static_cast<int>(i % 17) - 8) * 0.125f;
+    int device = 0;
+    cudaDeviceProp properties;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    if (shared_bytes > properties.sharedMemPerBlockOptin) {
+        std::fprintf(stderr, "Requested %zu shared bytes per block; device limit is %zu\n",
+                     shared_bytes, properties.sharedMemPerBlockOptin);
+        return 1;
     }
-    for (size_t i = 0; i < B.size(); ++i) {
-        B[i] = static_cast<float>(static_cast<int>(i % 19) - 9) * 0.125f;
+    if (shared_bytes > properties.sharedMemPerBlock) {
+        CUDA_CHECK(cudaFuncSetAttribute(tiled_matmul,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared_bytes)));
     }
 
-    reference_matmul(A.data(), B.data(), reference_C.data(), M, N, K);
+    std::vector<__half> Q(static_cast<size_t>(M) * d);
+    std::vector<__half> K(static_cast<size_t>(N) * d);
+    std::vector<float> S(static_cast<size_t>(M) * N);
+    std::vector<float> reference_S(static_cast<size_t>(M) * N);
+    std::vector<uint64_t> routing_words(query_tile_count, uint64_t{0});
+    
+    // Initialize with random
+    for (size_t i = 0; i < Q.size(); ++i) {
+        Q[i] = __float2half(static_cast<float>(static_cast<int>(i % 17) - 8) * 0.125f);
+    }
+    for (size_t i = 0; i < K.size(); ++i) {
+        K[i] = __float2half(static_cast<float>(static_cast<int>(i % 19) - 9) * 0.125f);
+    }
 
-    float* device_A = nullptr;
-    float* device_B = nullptr;
-    float* device_C = nullptr;
+    reference_matmul(Q.data(), K.data(), reference_S.data(), M, N, d);
 
-    CUDA_CHECK(cudaMalloc(&device_A, A_bytes));
-    CUDA_CHECK(cudaMalloc(&device_B, B_bytes));
-    CUDA_CHECK(cudaMalloc(&device_C, C_bytes));
+    __half* device_Q = nullptr;
+    __half* device_K = nullptr;
+    float* device_S = nullptr;
+    uint64_t* device_routing_words = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&device_Q, Q_bytes));
+    CUDA_CHECK(cudaMalloc(&device_K, K_bytes));
+    CUDA_CHECK(cudaMalloc(&device_S, S_bytes));
+    CUDA_CHECK(cudaMalloc(&device_routing_words, routing_bytes));
 
     CUDA_CHECK(cudaMemcpy(
-        device_A, A.data(), A_bytes, cudaMemcpyHostToDevice));
+        device_Q, Q.data(), Q_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(
-        device_B, B.data(), B_bytes, cudaMemcpyHostToDevice));
+        device_K, K.data(), K_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_routing_words, routing_words.data(),
+                          routing_bytes, cudaMemcpyHostToDevice));
 
-    const dim3 block(16, 16);
-    const dim3 grid((N + block.x - 1) / block.x,
-                    (M + block.y - 1) / block.y);
+    const dim3 block(threads);
+    const dim3 grid(query_tile_count);
 
-    // Warm up CUDA and verify one execution.
-    tiled_matmul<<<grid, block>>>(device_A, device_B, device_C, M, N, K);
+    tiled_matmul<<<grid, block, shared_bytes>>>(
+        device_Q, device_K, device_S, M, N, d, device_routing_words);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     CUDA_CHECK(cudaMemcpy(
-        C.data(), device_C, C_bytes, cudaMemcpyDeviceToHost));
+        S.data(), device_S, S_bytes, cudaMemcpyDeviceToHost));
 
     constexpr float absolute_tolerance = 1.0e-4f;
     constexpr float relative_tolerance = 1.0e-4f;
     float max_absolute_error = 0.0f;
     float max_relative_error = 0.0f;
 
-    for (size_t i = 0; i < C.size(); ++i) {
-        const float absolute_error = std::fabs(C[i] - reference_C[i]);
+    for (size_t i = 0; i < S.size(); ++i) {
+        const float absolute_error = std::fabs(S[i] - reference_S[i]);
         const float relative_error =
-            absolute_error / std::fmax(std::fabs(reference_C[i]), absolute_tolerance);
+            absolute_error / std::fmax(std::fabs(reference_S[i]), absolute_tolerance);
         const float allowed_error =
-            absolute_tolerance + relative_tolerance * std::fabs(reference_C[i]);
+            absolute_tolerance + relative_tolerance * std::fabs(reference_S[i]);
 
         max_absolute_error = std::fmax(max_absolute_error, absolute_error);
         max_relative_error = std::fmax(max_relative_error, relative_error);
 
-        if (absolute_error > allowed_error) {
+        if (!std::isfinite(S[i]) || !std::isfinite(reference_S[i]) ||
+            absolute_error > allowed_error) {
             std::fprintf(stderr,
                          "Incorrect result at %zu: got %.8f, expected %.8f, "
                          "error %.8f, allowed %.8f\n",
-                         i, C[i], reference_C[i], absolute_error, allowed_error);
+                         i, S[i], reference_S[i], absolute_error, allowed_error);
             return 1;
         }
     }
 
     std::printf("Correctness: PASS (max abs error %.8g, max rel error %.8g)\n",
                 max_absolute_error, max_relative_error);
+    std::printf("M=%d N=%d d=%d, shared memory per block: %zu bytes\n",
+                M, N, d, shared_bytes);
 
     cudaEvent_t start, stop;
     
@@ -124,8 +159,8 @@ int main() {
     CUDA_CHECK(cudaEventRecord(start));
 
     for (int i = 0; i < iterations; ++i) {
-        tiled_matmul<<<grid, block>>>(
-            device_A, device_B, device_C, M, N, K);
+        tiled_matmul<<<grid, block, shared_bytes>>>(
+            device_Q, device_K, device_S, M, N, d, device_routing_words);
     }
 
     CUDA_CHECK(cudaGetLastError());
@@ -136,7 +171,7 @@ int main() {
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
 
     const double average_ms = elapsed_ms / iterations;
-    const double operations = 2.0 * M * N * K;
+    const double operations = 2.0 * M * N * d;
     const double gflops = operations / (average_ms * 1.0e6);
 
     std::printf("Average kernel time: %.3f ms\n", average_ms);
@@ -144,9 +179,10 @@ int main() {
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    CUDA_CHECK(cudaFree(device_A));
-    CUDA_CHECK(cudaFree(device_B));
-    CUDA_CHECK(cudaFree(device_C));
+    CUDA_CHECK(cudaFree(device_Q));
+    CUDA_CHECK(cudaFree(device_K));
+    CUDA_CHECK(cudaFree(device_S));
+    CUDA_CHECK(cudaFree(device_routing_words));
 
     return 0;
 }
