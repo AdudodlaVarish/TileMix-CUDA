@@ -2,6 +2,8 @@
 #include <cuda_fp16.h>
 
 #include "matmul_config.h"
+#include "reference_softmax.h"
+#include "softmax.h"
 
 #include <cmath>
 #include <cstdint>
@@ -85,6 +87,8 @@ int main() {
     std::vector<__half> K(static_cast<size_t>(N) * d);
     std::vector<float> S(static_cast<size_t>(M) * N);
     std::vector<float> reference_S(static_cast<size_t>(M) * N);
+    std::vector<float> P(static_cast<size_t>(M) * N);
+    std::vector<float> reference_P(static_cast<size_t>(M) * N);
     std::vector<uint64_t> routing_words(query_tile_count, uint64_t{0});
     
     // Initialize with random
@@ -100,11 +104,13 @@ int main() {
     __half* device_Q = nullptr;
     __half* device_K = nullptr;
     float* device_S = nullptr;
+    float* device_P = nullptr;
     uint64_t* device_routing_words = nullptr;
 
     CUDA_CHECK(cudaMalloc(&device_Q, Q_bytes));
     CUDA_CHECK(cudaMalloc(&device_K, K_bytes));
     CUDA_CHECK(cudaMalloc(&device_S, S_bytes));
+    CUDA_CHECK(cudaMalloc(&device_P, S_bytes));
     CUDA_CHECK(cudaMalloc(&device_routing_words, routing_bytes));
 
     CUDA_CHECK(cudaMemcpy(
@@ -155,6 +161,43 @@ int main() {
     std::printf("M=%d N=%d d=%d, score_scale=%.8g, shared memory per block: %zu bytes\n",
                 M, N, d, score_scale, shared_bytes);
 
+    reference_softmax(reference_S.data(), reference_P.data(), M, N);
+    // NaN initialization makes missing probability stores fail validation.
+    CUDA_CHECK(cudaMemset(device_P, 0xff, S_bytes));
+    row_softmax<<<M, kSoftmaxThreads>>>(device_S, device_P, M, N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(P.data(), device_P, S_bytes, cudaMemcpyDeviceToHost));
+
+    constexpr float probability_atol = 1.0e-6f;
+    constexpr float probability_rtol = 1.0e-4f;
+    float probability_max_abs = 0.0f, probability_max_rel = 0.0f;
+    double probability_squared_error = 0.0;
+    for (size_t i = 0; i < P.size(); ++i) {
+        const float error = std::fabs(P[i] - reference_P[i]);
+        probability_max_abs = std::fmax(probability_max_abs, error);
+        probability_max_rel = std::fmax(probability_max_rel,
+            error / std::fmax(std::fabs(reference_P[i]), probability_atol));
+        probability_squared_error += static_cast<double>(error) * error;
+        if (!std::isfinite(P[i]) || P[i] < 0.0f || P[i] > 1.0f ||
+            error > probability_atol + probability_rtol * std::fabs(reference_P[i])) {
+            std::fprintf(stderr, "Softmax mismatch at %zu: got %.9g expected %.9g\n",
+                         i, P[i], reference_P[i]);
+            return 1;
+        }
+    }
+    for (int row = 0; row < M; ++row) {
+        double sum = 0.0;
+        for (int col = 0; col < N; ++col) sum += P[static_cast<size_t>(row) * N + col];
+        if (std::fabs(sum - 1.0) > 1.0e-5) {
+            std::fprintf(stderr, "Softmax row %d sums to %.17g\n", row, sum);
+            return 1;
+        }
+    }
+    std::printf("Softmax: PASS (atol=1e-6 rtol=1e-4, max_abs_error=%.9g, "
+                "max_rel_error=%.9g, rms_error=%.9g)\n", probability_max_abs,
+                probability_max_rel, std::sqrt(probability_squared_error / P.size()));
+
     cudaEvent_t start, stop;
     
     CUDA_CHECK(cudaEventCreate(&start));
@@ -178,14 +221,15 @@ int main() {
     const double operations = 2.0 * M * N * d;
     const double gflops = operations / (average_ms * 1.0e6);
 
-    std::printf("Average kernel time: %.3f ms\n", average_ms);
-    std::printf("Throughput: %.1f GFLOP/s\n", gflops);
+    std::printf("Average scaled-QK kernel time: %.3f ms\n", average_ms);
+    std::printf("Scaled-QK throughput: %.1f GFLOP/s\n", gflops);
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
     CUDA_CHECK(cudaFree(device_Q));
     CUDA_CHECK(cudaFree(device_K));
     CUDA_CHECK(cudaFree(device_S));
+    CUDA_CHECK(cudaFree(device_P));
     CUDA_CHECK(cudaFree(device_routing_words));
 
     return 0;

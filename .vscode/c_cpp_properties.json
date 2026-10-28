@@ -6,6 +6,7 @@
             "compilerArgs": ["-std=c++17", "-arch=sm_80"],
             "includePath": [
                 "${workspaceFolder}",
+                "${workspaceFolder}/include",
                 "${env:HOME}/.local/cuda-13.4.3/include"
             ],
             "cStandard": "c17",
