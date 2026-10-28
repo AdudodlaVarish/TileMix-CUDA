@@ -14,6 +14,7 @@ __global__ void tiled_matmul(const __half* Q,
                              int M,
                              int N,
                              int d,
+                             float score_scale,
                              const uint64_t* routing_words);
 
 #define CUDA_CHECK(call)                                                \
@@ -26,13 +27,14 @@ __global__ void tiled_matmul(const __half* Q,
         }                                                               \
     } while (0)
  
-// Baseline
+// Independent FP64 oracle: S = (Q @ K.T) / sqrt(d), using rounded FP16 inputs.
 void reference_matmul(const __half* Q,
                       const __half* K,
                       float* S,
                       int M,
                       int N,
                       int d) {
+    const double score_scale = 1.0 / std::sqrt(static_cast<double>(d));
     for (int row = 0; row < M; ++row) {
         for (int col = 0; col < N; ++col) {
             double sum = 0.0;
@@ -40,7 +42,7 @@ void reference_matmul(const __half* Q,
                 sum += static_cast<double>(__half2float(Q[static_cast<size_t>(row) * d + feature])) *
                        static_cast<double>(__half2float(K[static_cast<size_t>(col) * d + feature]));
             }
-            S[static_cast<size_t>(row) * N + col] = static_cast<float>(sum);
+            S[static_cast<size_t>(row) * N + col] = static_cast<float>(sum * score_scale);
         }
     }
 }
@@ -53,6 +55,7 @@ int main() {
     static_assert(M > 0 && N > 0 && d > 0 && iterations > 0);
     static_assert(N <= 64 * kBlockN);
 
+    const float score_scale = 1.0f / std::sqrt(static_cast<float>(d));
     const size_t Q_bytes = static_cast<size_t>(M) * d * sizeof(__half);
     const size_t K_bytes = static_cast<size_t>(N) * d * sizeof(__half);
     const size_t S_bytes = static_cast<size_t>(M) * N * sizeof(float);
@@ -115,7 +118,7 @@ int main() {
     const dim3 grid(query_tile_count);
 
     tiled_matmul<<<grid, block, shared_bytes>>>(
-        device_Q, device_K, device_S, M, N, d, device_routing_words);
+        device_Q, device_K, device_S, M, N, d, score_scale, device_routing_words);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -149,8 +152,8 @@ int main() {
 
     std::printf("Correctness: PASS (max abs error %.8g, max rel error %.8g)\n",
                 max_absolute_error, max_relative_error);
-    std::printf("M=%d N=%d d=%d, shared memory per block: %zu bytes\n",
-                M, N, d, shared_bytes);
+    std::printf("M=%d N=%d d=%d, score_scale=%.8g, shared memory per block: %zu bytes\n",
+                M, N, d, score_scale, shared_bytes);
 
     cudaEvent_t start, stop;
     
@@ -161,7 +164,7 @@ int main() {
 
     for (int i = 0; i < iterations; ++i) {
         tiled_matmul<<<grid, block, shared_bytes>>>(
-            device_Q, device_K, device_S, M, N, d, device_routing_words);
+            device_Q, device_K, device_S, M, N, d, score_scale, device_routing_words);
     }
 
     CUDA_CHECK(cudaGetLastError());

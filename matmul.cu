@@ -14,11 +14,13 @@
 
 namespace wmma = nvcuda::wmma;
 
-__global__ void tiled_matmul(const __half* Q, const __half* K, float* S, int M, int N, int d, const uint64_t* routing_words) {
+// Contiguous Q[M,d], K[N,d]; S[M,N] = score_scale * Q @ K.T in FP32.
+__global__ void tiled_matmul(const __half* Q, const __half* K, float* S, int M, int N, int d, float score_scale, const uint64_t* routing_words) {
 
     assert(blockDim.x == kThreads &&
            blockDim.y == 1 && blockDim.z == 1);
     assert(M > 0 && N > 0 && d > 0);
+    // Ensure we have a routing word for every tile
     assert(N <= 64 * kBlockN);
     
     // Ceil(d / kTileK) * kTileK
@@ -82,7 +84,7 @@ __global__ void tiled_matmul(const __half* Q, const __half* K, float* S, int M, 
             const int query = query_begin + index / kBlockN;
             const int key = key_begin + index % kBlockN;
             if (query < M && key < N) {
-                S[static_cast<size_t>(query) * N + key] = S_tile[index];
+                S[static_cast<size_t>(query) * N + key] = S_tile[index] * score_scale;
             }
         }
 
