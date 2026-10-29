@@ -20,8 +20,8 @@ target_include_directories(tilemix_fp16 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_compile_features(tilemix_fp16 PUBLIC cxx_std_17 cuda_std_17)
 target_compile_options(tilemix_fp16 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
-add_executable(attention_smoke src/main.cu)
-target_link_libraries(attention_smoke PRIVATE tilemix_fp16)
+add_executable(benchmarks src/benchmarks.cu)
+target_link_libraries(benchmarks PRIVATE tilemix_fp16)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -34,10 +34,6 @@ if(BUILD_TESTING)
         set_tests_properties(${name}_gpu PROPERTIES
             LABELS gpu RESOURCE_LOCK cuda_device TIMEOUT 120)
     endforeach()
-    add_test(NAME attention_smoke_gpu COMMAND attention_smoke)
-    set_tests_properties(attention_smoke_gpu PROPERTIES
-        LABELS gpu RESOURCE_LOCK cuda_device TIMEOUT 120)
-
     # Prefer the project oracle environment; an explicit interpreter overrides it.
     # Configuring never creates an environment or installs packages.
     if(NOT DEFINED Python3_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python")
