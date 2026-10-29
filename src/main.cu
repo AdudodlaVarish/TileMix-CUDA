@@ -3,6 +3,7 @@
 
 #include "matmul_config.h"
 #include "matmul.h"
+#include "attention_fused.h"
 #include "pv.h"
 #include "reference_attention.h"
 #include "reference_softmax.h"
@@ -248,6 +249,33 @@ int main(int argc, char** argv) {
     std::printf("Unfused attention: PASS (atol=1e-5 rtol=1e-4, max_abs_error=%.9g, "
                 "max_rel_error=%.9g, rms_error=%.9g)\n", output_max_abs, output_max_rel,
                 std::sqrt(output_squared_error / O.size()));
+
+    const std::vector<float> unfused_O = O;
+    CUDA_CHECK(cudaMemset(device_O, 0xff, O_bytes));
+    CUDA_CHECK(launch_fused_fp16_attention(device_Q, device_K, device_V, device_O,
+                                          M, N, d, score_scale));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(O.data(), device_O, O_bytes, cudaMemcpyDeviceToHost));
+    double fused_max_abs = 0.0, fused_max_rel = 0.0, fused_squared_error = 0.0;
+    double max_unfused_difference = 0.0;
+    for (size_t i = 0; i < O.size(); ++i) {
+        const double error = std::fabs(O[i] - reference_O[i]);
+        const double difference = std::fabs(static_cast<double>(O[i]) - unfused_O[i]);
+        if (!std::isfinite(O[i]) || error > output_atol + output_rtol * std::fabs(reference_O[i]) ||
+            difference > output_atol + output_rtol * std::fabs(unfused_O[i])) {
+            std::fprintf(stderr, "Fused attention mismatch at %zu: got %.9g, "
+                         "FP64 %.17g, unfused %.9g\n", i, O[i], reference_O[i], unfused_O[i]);
+            return 1;
+        }
+        fused_max_abs = std::fmax(fused_max_abs, error);
+        fused_max_rel = std::fmax(fused_max_rel, error / std::fmax(std::fabs(reference_O[i]), output_atol));
+        fused_squared_error += error * error;
+        max_unfused_difference = std::fmax(max_unfused_difference, difference);
+    }
+    std::printf("Fused FP16 attention: PASS (atol=1e-5 rtol=1e-4, max_abs_error=%.9g, "
+                "max_rel_error=%.9g, rms_error=%.9g, max_unfused_difference=%.9g)\n",
+                fused_max_abs, fused_max_rel, std::sqrt(fused_squared_error / O.size()),
+                max_unfused_difference);
 
     // Correctness-only by default; timing requires an explicit request.
     if (benchmark_qk) {

@@ -1,4 +1,5 @@
 #include "matmul.h"
+#include "attention_fused.h"
 #include "matmul_config.h"
 #include "pv.h"
 #include "reference_attention.h"
@@ -200,6 +201,15 @@ void gpu_case(const Shape& shape, const cudaDeviceProp& properties) {
     cuda_check(cudaDeviceSynchronize());
     cuda_check(cudaMemcpy(actual.data(), dout.data, q_count * sizeof(float), cudaMemcpyDeviceToHost));
     compare(actual, expected, "CUDA complete attention", 1e-5, 1e-4);
+
+    const std::vector<double> unfused(actual.begin(), actual.end());
+    cuda_check(cudaMemset(dout.data, 0xff, q_count * sizeof(float)));
+    cuda_check(launch_fused_fp16_attention(dq.data, dk.data, dv.data, dout.data,
+        m, n, d, 1.0f / std::sqrt(static_cast<float>(d))));
+    cuda_check(cudaDeviceSynchronize());
+    cuda_check(cudaMemcpy(actual.data(), dout.data, q_count * sizeof(float), cudaMemcpyDeviceToHost));
+    compare(actual, expected, "CUDA fused attention vs FP64", 1e-5, 1e-4);
+    compare(actual, unfused, "CUDA fused vs unfused attention", 1e-5, 1e-4);
 }
 
 void gpu_checks() {
