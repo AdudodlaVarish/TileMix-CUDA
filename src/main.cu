@@ -2,22 +2,17 @@
 #include <cuda_fp16.h>
 
 #include "matmul_config.h"
+#include "matmul.h"
+#include "pv.h"
+#include "reference_attention.h"
 #include "reference_softmax.h"
 #include "softmax.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
-
-__global__ void tiled_matmul(const __half* Q,
-                             const __half* K,
-                             float* S,
-                             int M,
-                             int N,
-                             int d,
-                             float score_scale,
-                             const uint64_t* routing_words);
 
 #define CUDA_CHECK(call)                                                \
     do {                                                                \
@@ -49,7 +44,12 @@ void reference_matmul(const __half* Q,
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool benchmark_qk = argc == 2 && std::strcmp(argv[1], "--benchmark-qk") == 0;
+    if (argc != 1 && !benchmark_qk) {
+        std::fprintf(stderr, "Usage: %s [--benchmark-qk]\n", argv[0]);
+        return 1;
+    }
     constexpr int M = 1000;
     constexpr int N = 1003;
     constexpr int d = 128;
@@ -60,6 +60,7 @@ int main() {
     const float score_scale = 1.0f / std::sqrt(static_cast<float>(d));
     const size_t Q_bytes = static_cast<size_t>(M) * d * sizeof(__half);
     const size_t K_bytes = static_cast<size_t>(N) * d * sizeof(__half);
+    const size_t O_bytes = static_cast<size_t>(M) * d * sizeof(float);
     const size_t S_bytes = static_cast<size_t>(M) * N * sizeof(float);
     constexpr int padded_d = ((d + kTileK - 1) / kTileK) * kTileK;
     // Shared FP16 Q/K tiles followed by the FP32 score tile.
@@ -73,6 +74,16 @@ int main() {
     cudaDeviceProp properties;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    size_t free_bytes, total_bytes;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const size_t required_bytes = Q_bytes + 2 * K_bytes + 2 * S_bytes + O_bytes + routing_bytes;
+    if (required_bytes > free_bytes / 4) {
+        std::fprintf(stderr, "Attention test needs %zu bytes; available VRAM is %zu bytes\n",
+                     required_bytes, free_bytes);
+        return 1;
+    }
+    std::printf("GPU=%s cc=%d.%d free_bytes=%zu total_bytes=%zu\n", properties.name,
+                properties.major, properties.minor, free_bytes, total_bytes);
     if (shared_bytes > properties.sharedMemPerBlockOptin) {
         std::fprintf(stderr, "Requested %zu shared bytes per block; device limit is %zu\n",
                      shared_bytes, properties.sharedMemPerBlockOptin);
@@ -85,6 +96,9 @@ int main() {
 
     std::vector<__half> Q(static_cast<size_t>(M) * d);
     std::vector<__half> K(static_cast<size_t>(N) * d);
+    std::vector<__half> V(static_cast<size_t>(N) * d);
+    std::vector<float> O(static_cast<size_t>(M) * d);
+    std::vector<double> reference_O(static_cast<size_t>(M) * d);
     std::vector<float> S(static_cast<size_t>(M) * N);
     std::vector<float> reference_S(static_cast<size_t>(M) * N);
     std::vector<float> P(static_cast<size_t>(M) * N);
@@ -98,17 +112,24 @@ int main() {
     for (size_t i = 0; i < K.size(); ++i) {
         K[i] = __float2half(static_cast<float>(static_cast<int>(i % 19) - 9) * 0.125f);
     }
+    for (size_t i = 0; i < V.size(); ++i) {
+        V[i] = __float2half(static_cast<float>(static_cast<int>(i % 23) - 11) * 0.1f);
+    }
 
     reference_matmul(Q.data(), K.data(), reference_S.data(), M, N, d);
 
     __half* device_Q = nullptr;
     __half* device_K = nullptr;
+    __half* device_V = nullptr;
+    float* device_O = nullptr;
     float* device_S = nullptr;
     float* device_P = nullptr;
     uint64_t* device_routing_words = nullptr;
 
     CUDA_CHECK(cudaMalloc(&device_Q, Q_bytes));
     CUDA_CHECK(cudaMalloc(&device_K, K_bytes));
+    CUDA_CHECK(cudaMalloc(&device_V, K_bytes));
+    CUDA_CHECK(cudaMalloc(&device_O, O_bytes));
     CUDA_CHECK(cudaMalloc(&device_S, S_bytes));
     CUDA_CHECK(cudaMalloc(&device_P, S_bytes));
     CUDA_CHECK(cudaMalloc(&device_routing_words, routing_bytes));
@@ -117,6 +138,8 @@ int main() {
         device_Q, Q.data(), Q_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(
         device_K, K.data(), K_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        device_V, V.data(), K_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_routing_words, routing_words.data(),
                           routing_bytes, cudaMemcpyHostToDevice));
 
@@ -198,36 +221,69 @@ int main() {
                 "max_rel_error=%.9g, rms_error=%.9g)\n", probability_max_abs,
                 probability_max_rel, std::sqrt(probability_squared_error / P.size()));
 
-    cudaEvent_t start, stop;
-    
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
-    CUDA_CHECK(cudaEventRecord(start));
-
-    for (int i = 0; i < iterations; ++i) {
-        tiled_matmul<<<grid, block, shared_bytes>>>(
-            device_Q, device_K, device_S, M, N, d, score_scale, device_routing_words);
-    }
-
+    // Full FP64 attention oracle, independent of the CUDA S/P intermediates.
+    reference_attention(Q.data(), K.data(), V.data(), reference_O.data(), M, N, d);
+    CUDA_CHECK(cudaMemset(device_O, 0xff, O_bytes));
+    const unsigned pv_blocks = static_cast<unsigned>((O.size() - 1) / kPVThreads + 1);
+    attention_pv<<<pv_blocks, kPVThreads>>>(device_P, device_V, device_O, M, N, d);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(O.data(), device_O, O_bytes, cudaMemcpyDeviceToHost));
 
-    float elapsed_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    constexpr double output_atol = 1.0e-5, output_rtol = 1.0e-4;
+    double output_max_abs = 0.0, output_max_rel = 0.0, output_squared_error = 0.0;
+    for (size_t i = 0; i < O.size(); ++i) {
+        const double error = std::fabs(O[i] - reference_O[i]);
+        output_max_abs = std::fmax(output_max_abs, error);
+        output_max_rel = std::fmax(output_max_rel,
+            error / std::fmax(std::fabs(reference_O[i]), output_atol));
+        output_squared_error += error * error;
+        if (!std::isfinite(O[i]) || !std::isfinite(reference_O[i]) ||
+            error > output_atol + output_rtol * std::fabs(reference_O[i])) {
+            std::fprintf(stderr, "Attention mismatch at %zu: got %.9g expected %.17g\n",
+                         i, O[i], reference_O[i]);
+            return 1;
+        }
+    }
+    std::printf("Unfused attention: PASS (atol=1e-5 rtol=1e-4, max_abs_error=%.9g, "
+                "max_rel_error=%.9g, rms_error=%.9g)\n", output_max_abs, output_max_rel,
+                std::sqrt(output_squared_error / O.size()));
 
-    const double average_ms = elapsed_ms / iterations;
-    const double operations = 2.0 * M * N * d;
-    const double gflops = operations / (average_ms * 1.0e6);
+    // Correctness-only by default; timing requires an explicit request.
+    if (benchmark_qk) {
+        cudaEvent_t start, stop;
 
-    std::printf("Average scaled-QK kernel time: %.3f ms\n", average_ms);
-    std::printf("Scaled-QK throughput: %.1f GFLOP/s\n", gflops);
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
 
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
+        CUDA_CHECK(cudaEventRecord(start));
+
+        for (int i = 0; i < iterations; ++i) {
+            tiled_matmul<<<grid, block, shared_bytes>>>(
+                device_Q, device_K, device_S, M, N, d, score_scale, device_routing_words);
+        }
+
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+
+        const double average_ms = elapsed_ms / iterations;
+        const double operations = 2.0 * M * N * d;
+        const double gflops = operations / (average_ms * 1.0e6);
+
+        std::printf("Average scaled-QK kernel time: %.3f ms\n", average_ms);
+        std::printf("Scaled-QK throughput: %.1f GFLOP/s\n", gflops);
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
     CUDA_CHECK(cudaFree(device_Q));
     CUDA_CHECK(cudaFree(device_K));
+    CUDA_CHECK(cudaFree(device_V));
+    CUDA_CHECK(cudaFree(device_O));
     CUDA_CHECK(cudaFree(device_S));
     CUDA_CHECK(cudaFree(device_P));
     CUDA_CHECK(cudaFree(device_routing_words));

@@ -3,6 +3,7 @@
 #include <mma.h>
 
 #include "matmul_config.h"
+#include "matmul.h"
 
 #include <cassert>
 #include <cstddef>
