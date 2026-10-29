@@ -174,7 +174,6 @@ void gpu_case(const Shape& shape, const cudaDeviceProp& properties) {
     cuda_check(cudaMemcpy(dv.data, v.data(), kv_count * sizeof(__half), cudaMemcpyHostToDevice));
     cuda_check(cudaMemcpy(dp.data, p.data(), s_count * sizeof(float), cudaMemcpyHostToDevice));
     cuda_check(cudaMemcpy(routes.data, routing.data(), routing.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    // Cap the test grid so larger outputs also exercise the grid-stride loop.
     const unsigned blocks = std::min(2u, static_cast<unsigned>((q_count - 1) / kPVThreads + 1));
     std::printf("Case B=1 H=1 M=%d N=%d d=%d pattern=%s contiguous QK/V=FP16 P/O=FP32 "
                 "QK_tile=%dx%d PV_threads=%d\n", m, n, d, shape.pattern, kBlockM, kBlockN, kPVThreads);
@@ -194,6 +193,21 @@ void gpu_case(const Shape& shape, const cudaDeviceProp& properties) {
     tiled_matmul<<<query_tiles, kThreads, shared_bytes>>>(
         dq.data, dk.data, ds.data, m, n, d, 1.0f / std::sqrt(static_cast<float>(d)), routes.data);
     cuda_check(cudaGetLastError());
+    std::vector<float> scores(s_count);
+    std::vector<double> expected_scores(s_count);
+    const double score_scale = 1.0 / std::sqrt(static_cast<double>(d));
+    for (int query = 0; query < m; ++query) {
+        for (int key = 0; key < n; ++key) {
+            double dot = 0.0;
+            for (int feature = 0; feature < d; ++feature) {
+                dot += static_cast<double>(__half2float(q[static_cast<size_t>(query) * d + feature])) *
+                       static_cast<double>(__half2float(k[static_cast<size_t>(key) * d + feature]));
+            }
+            expected_scores[static_cast<size_t>(query) * n + key] = dot * score_scale;
+        }
+    }
+    cuda_check(cudaMemcpy(scores.data(), ds.data, s_count * sizeof(float), cudaMemcpyDeviceToHost));
+    compare(scores, expected_scores, "CUDA isolated scaled QK", 1e-4, 1e-4);
     row_softmax<<<m, kSoftmaxThreads>>>(ds.data, dp.data, m, n);
     cuda_check(cudaGetLastError());
     attention_pv<<<blocks, kPVThreads>>>(dp.data, dv.data, dout.data, m, n, d);

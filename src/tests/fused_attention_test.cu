@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -45,6 +47,12 @@ Inputs inputs(const Shape& shape) {
     for (auto& x : result.k) x = random_value();
     for (auto& x : result.v) x = random_value();
     const std::string pattern = shape.pattern;
+    if (pattern == "zeros") {
+        std::fill(result.q.begin(), result.q.end(), __float2half(0.0f));
+        std::fill(result.k.begin(), result.k.end(), __float2half(0.0f));
+        std::fill(result.v.begin(), result.v.end(), __float2half(0.0f));
+        return result;
+    }
     if (pattern == "random") return result;
     if (pattern == "constant-v") {
         for (int key = 0; key < n; ++key) {
@@ -112,6 +120,12 @@ void cpu_checks() {
     float out;
     require(launch_fused_fp16_attention(nullptr, &x, &x, &out, 1, 1, 1, 1.0f) == cudaErrorInvalidValue,
             "null input accepted");
+    require(launch_fused_fp16_attention(&x, nullptr, &x, &out, 1, 1, 1, 1.0f) == cudaErrorInvalidValue,
+            "null K accepted");
+    require(launch_fused_fp16_attention(&x, &x, nullptr, &out, 1, 1, 1, 1.0f) == cudaErrorInvalidValue,
+            "null V accepted");
+    require(launch_fused_fp16_attention(&x, &x, &x, nullptr, 1, 1, 1, 1.0f) == cudaErrorInvalidValue,
+            "null O accepted");
     for (int dimension : {0, -1}) {
         require(launch_fused_fp16_attention(&x, &x, &x, &out, dimension, 1, 1, 1.0f) == cudaErrorInvalidValue,
                 "invalid M accepted");
@@ -122,8 +136,12 @@ void cpu_checks() {
     }
     require(launch_fused_fp16_attention(&x, &x, &x, &out, 1, 1, 129, 1.0f) == cudaErrorNotSupported,
             "unsupported head dimension accepted");
-    require(launch_fused_fp16_attention(&x, &x, &x, &out, 1, 1, 1,
-            std::numeric_limits<float>::quiet_NaN()) == cudaErrorInvalidValue, "invalid scale accepted");
+    for (float scale : {std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::infinity(),
+                        -std::numeric_limits<float>::infinity()}) {
+        require(launch_fused_fp16_attention(&x, &x, &x, &out, 1, 1, 1,
+                scale) == cudaErrorInvalidValue, "invalid scale accepted");
+    }
     require(fused_fp16_shared_bytes(1) == 4608 && fused_fp16_shared_bytes(17) == 7168 &&
             fused_fp16_shared_bytes(128) == 22528 && fused_fp16_shared_bytes(129) == 0,
             "incorrect shared-memory footprint");
@@ -155,7 +173,7 @@ void cpu_checks() {
     }
 }
 
-void gpu_case(const Shape& shape) {
+void gpu_case(const Shape& shape, std::ostream* fixtures) {
     const size_t count = static_cast<size_t>(shape.m) * shape.d;
     const size_t kv_count = static_cast<size_t>(shape.n) * shape.d;
     const size_t bytes = sizeof(__half) * (count + 2 * kv_count) + sizeof(float) * (count + 2);
@@ -186,9 +204,35 @@ void gpu_case(const Shape& shape) {
                 kBlockM, kBlockN, kThreads, fused_fp16_shared_bytes(shape.d));
     compare(std::vector<float>(guarded.begin() + 1, guarded.end() - 1), expected,
             "CUDA fused vs FP64", 1e-5, 1e-4);
+    if (fixtures) {
+        // Decimal FP32 max_digits10 preserves every rounded FP16 input and
+        // every FP32 output on a JSON round trip to an independent oracle.
+        auto& out = *fixtures;
+        out << std::setprecision(std::numeric_limits<float>::max_digits10)
+            << "{\"m\":" << shape.m << ",\"n\":" << shape.n << ",\"d\":" << shape.d
+            << ",\"pattern\":\"" << shape.pattern << "\"";
+        const auto write_half = [&](const char* name, const std::vector<__half>& values) {
+            out << ",\"" << name << "\":[";
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (i) out << ',';
+                out << __half2float(values[i]);
+            }
+            out << ']';
+        };
+        write_half("q", data.q);
+        write_half("k", data.k);
+        write_half("v", data.v);
+        out << ",\"o\":[";
+        for (size_t i = 1; i <= count; ++i) {
+            if (i != 1) out << ',';
+            out << guarded[i];
+        }
+        out << "]}\n";
+        if (!out) throw std::runtime_error("failed to write JSON fixture");
+    }
 }
 
-void gpu_checks() {
+void gpu_checks(std::ostream* fixtures) {
     int device, driver, runtime;
     cudaDeviceProp properties{};
     cuda_check(cudaGetDevice(&device));
@@ -199,22 +243,35 @@ void gpu_checks() {
     cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes));
     std::printf("GPU=%s cc=%d.%d free_bytes=%zu total_bytes=%zu driver=%d runtime=%d\n",
                 properties.name, properties.major, properties.minor, free_bytes, total_bytes, driver, runtime);
-    for (int d : {1, 17, 33, 49, 65, 81, 97, 113, 128}) gpu_case({3, 33, d, "random"});
+    for (int d : {1, 17, 33, 49, 65, 81, 97, 113, 128}) gpu_case({3, 33, d, "random"}, fixtures);
     const Shape cases[] = {{1, 1, 1, "random"}, {17, 33, 17, "random"},
         {35, 67, 65, "random"}, {17, 65, 128, "random"},
         {17, 65, 1, "rising"}, {17, 65, 1, "falling"}, {17, 129, 1, "alternating"},
         {17, 65, 1, "late-extreme"}, {17, 33, 1, "negative"},
-        {17, 65, 17, "constant-v"}, {3, 2051, 17, "random"}, {1, 4097, 128, "uniform"}};
-    for (const auto& shape : cases) gpu_case(shape);
+        {17, 33, 17, "zeros"}, {17, 65, 17, "constant-v"},
+        {3, 2051, 17, "random"}, {1, 4097, 128, "uniform"}};
+    for (const auto& shape : cases) gpu_case(shape, fixtures);
 }
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
         const bool cpu_only = argc == 2 && std::string(argv[1]) == "--cpu-only";
-        if (argc != 1 && !cpu_only) throw std::invalid_argument("usage: fused_attention_test [--cpu-only]");
+        const bool export_json = argc == 3 && std::string(argv[1]) == "--export-json";
+        if (argc != 1 && !cpu_only && !export_json) {
+            throw std::invalid_argument("usage: fused_attention_test [--cpu-only | --export-json FILE]");
+        }
+        std::ofstream fixtures;
+        if (export_json) {
+            fixtures.open(argv[2]);
+            if (!fixtures) throw std::runtime_error("could not open JSON fixture file");
+        }
         cpu_checks();
-        if (!cpu_only) gpu_checks();
+        if (!cpu_only) gpu_checks(export_json ? &fixtures : nullptr);
+        if (export_json) {
+            fixtures.close();
+            if (!fixtures) throw std::runtime_error("could not close JSON fixture file");
+        }
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "ERROR: %s\n", error.what());

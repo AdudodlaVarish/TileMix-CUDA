@@ -2,3 +2,7 @@ outputs/
 reports/
 AGENTS.md
 notes/
+README.md
+build*/
+__pycache__/
+.venv/
