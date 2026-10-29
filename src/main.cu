@@ -9,6 +9,7 @@
 #include "reference_softmax.h"
 #include "softmax.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -47,8 +48,9 @@ void reference_matmul(const __half* Q,
 
 int main(int argc, char** argv) {
     const bool benchmark_qk = argc == 2 && std::strcmp(argv[1], "--benchmark-qk") == 0;
-    if (argc != 1 && !benchmark_qk) {
-        std::fprintf(stderr, "Usage: %s [--benchmark-qk]\n", argv[0]);
+    const bool benchmark_fused = argc == 2 && std::strcmp(argv[1], "--benchmark-fused") == 0;
+    if (argc != 1 && !benchmark_qk && !benchmark_fused) {
+        std::fprintf(stderr, "Usage: %s [--benchmark-qk | --benchmark-fused]\n", argv[0]);
         return 1;
     }
     constexpr int M = 1000;
@@ -307,6 +309,84 @@ int main(int argc, char** argv) {
 
         CUDA_CHECK(cudaEventDestroy(start));
         CUDA_CHECK(cudaEventDestroy(stop));
+    }
+    if (benchmark_fused) {
+        constexpr int warmup = 20;
+        constexpr int trials = 11;
+        static_assert(trials >= 3 && trials % 2 == 1);
+
+        int driver, runtime;
+        CUDA_CHECK(cudaDriverGetVersion(&driver));
+        CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
+        std::printf("Fused benchmark: B=1 H=1 Lq=%d Lk=%d d=%d noncausal "
+                    "Q/K/V=FP16 O=FP32 scores/state/PV_accum=FP32\n", M, N, d);
+        std::printf("Strides (elements): Q/K/V/O=(%d,1); tile=%dx%d threads=%d "
+                    "padded_d=%d shared_bytes=%zu\n", d, kBlockM, kBlockN, kThreads,
+                    padded_d, fused_fp16_shared_bytes(d));
+        std::printf("CUDA driver_api=%d runtime=%d toolkit=%d.%d.%d host_compiler=%s\n",
+                    driver, runtime, __CUDACC_VER_MAJOR__, __CUDACC_VER_MINOR__,
+                    __CUDACC_VER_BUILD__, __VERSION__);
+        std::printf("Timing: CUDA-event device elapsed time; warmup=%d trials=%d "
+                    "launches_per_trial=%d; same resident buffers reused\n", warmup, trials, iterations);
+        std::puts("Scope: fused attention launches only; excludes allocation, transfers, "
+                  "CPU references and correctness checks; host submission gaps are included.");
+
+        cudaStream_t stream;
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+
+        for (int i = 0; i < warmup; ++i) {
+            CUDA_CHECK(launch_fused_fp16_attention(device_Q, device_K, device_V, device_O,
+                                                  M, N, d, score_scale, stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<double> samples_ms;
+        samples_ms.reserve(trials);
+        for (int trial = 0; trial < trials; ++trial) {
+            CUDA_CHECK(cudaEventRecord(start, stream));
+            for (int i = 0; i < iterations; ++i) {
+                CUDA_CHECK(launch_fused_fp16_attention(device_Q, device_K, device_V, device_O,
+                                                      M, N, d, score_scale, stream));
+            }
+            CUDA_CHECK(cudaEventRecord(stop, stream));
+            CUDA_CHECK(cudaEventSynchronize(stop));
+            float elapsed_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+            if (!std::isfinite(elapsed_ms) || elapsed_ms <= 0.0f) {
+                std::fprintf(stderr, "Invalid fused benchmark event interval: %.9g ms\n", elapsed_ms);
+                return 1;
+            }
+            samples_ms.push_back(static_cast<double>(elapsed_ms) / iterations);
+        }
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+
+        CUDA_CHECK(cudaMemcpy(O.data(), device_O, O_bytes, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < O.size(); ++i) {
+            if (!std::isfinite(O[i]) ||
+                std::fabs(O[i] - reference_O[i]) > output_atol + output_rtol * std::fabs(reference_O[i])) {
+                std::fprintf(stderr, "Post-benchmark fused mismatch at %zu: got %.9g expected %.17g\n",
+                             i, O[i], reference_O[i]);
+                return 1;
+            }
+        }
+        std::puts("Post-benchmark fused correctness: PASS (atol=1e-5 rtol=1e-4)");
+
+
+        std::sort(samples_ms.begin(), samples_ms.end());
+        const double median_ms = samples_ms[trials / 2];
+        const double p10_ms = samples_ms[(trials - 1) / 10];
+        const double p90_ms = samples_ms[9 * (trials - 1) / 10];
+        const double dense_operations = 4.0 * M * N * d;  
+        std::printf("Fused attention latency per launch (trial means): median=%.6f ms "
+                    "p10=%.6f ms p90=%.6f ms\n", median_ms, p10_ms, p90_ms);
+        std::printf("Dense QK+PV equivalent throughput at median: %.3f GFLOP/s "
+                    "(4*Lq*Lk*d; softmax operations excluded)\n",
+                    dense_operations / (median_ms * 1.0e6));
     }
     CUDA_CHECK(cudaFree(device_Q));
     CUDA_CHECK(cudaFree(device_K));
