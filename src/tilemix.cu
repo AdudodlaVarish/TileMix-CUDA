@@ -15,7 +15,8 @@ namespace wmma = nvcuda::wmma;
 
 __global__ void fused_fp16_attention(const __half* Q, const __half* K, const __half* V,
                                     float* O, int M, int N, int d, int padded_d,
-                                    float score_scale) {
+                                    float score_scale, TileMixRouting routing,
+                                    std::size_t routing_words_per_row, std::size_t key_tiles) {
     extern __shared__ __align__(32) unsigned char storage[];
     __half* q_tile = reinterpret_cast<__half*>(storage);
     __half* k_tile = q_tile + kBlockM * padded_d;
@@ -48,6 +49,16 @@ __global__ void fused_fp16_attention(const __half* Q, const __half* K, const __h
 
     for (std::size_t key_begin = 0; key_begin < static_cast<std::size_t>(N);
          key_begin += kBlockN) {
+        
+        const std::size_t key_tile = key_begin / kBlockN;
+        const std::size_t group = key_tile / routing.key_tiles_per_group;
+        const std::size_t mask_index = static_cast<std::size_t>(blockIdx.x) * routing_words_per_row + group / 64;
+        const std::uint64_t word = routing.words ? routing.words[mask_index] : std::uint64_t{0};
+        const bool int8_requested = ((word >> (group % 64)) & std::uint64_t{1}) != 0;
+        if (thread == 0 && routing.decoded_bits) {
+            routing.decoded_bits[static_cast<std::size_t>(blockIdx.x) * key_tiles + key_tile] = int8_requested;
+        }
+        
         for (int index = thread; index < kBlockN * padded_d; index += kThreads) {
             const int feature = index % padded_d;
             const std::size_t key = key_begin + index / padded_d;
@@ -136,11 +147,16 @@ __global__ void fused_fp16_attention(const __half* Q, const __half* K, const __h
 
 cudaError_t launch_fused_fp16_attention(const __half* Q, const __half* K, const __half* V,
                                        float* O, int M, int N, int d, float score_scale,
-                                       cudaStream_t stream) {
-    if (!Q || !K || !V || !O || M <= 0 || N <= 0 || d <= 0 || !std::isfinite(score_scale)) {
+                                       cudaStream_t stream, const TileMixRouting& routing) {
+    if (!Q || !K || !V || !O || M <= 0 || N <= 0 || d <= 0 || !std::isfinite(score_scale) ||
+        routing.key_tiles_per_group <= 0 || (!routing.words && routing.word_count != 0)) {
         return cudaErrorInvalidValue;
     }
     if (d > kFusedMaxHeadDim) return cudaErrorNotSupported;
+    const std::size_t words_per_row = tilemix_routing_words_per_row(N, routing.key_tiles_per_group);
+    if (routing.words && routing.word_count < tilemix_routing_word_count(M, N, routing.key_tiles_per_group)) {
+        return cudaErrorInvalidValue;
+    }
     int device;
     cudaDeviceProp properties{};
     cudaError_t status = cudaGetDevice(&device);
@@ -161,7 +177,8 @@ cudaError_t launch_fused_fp16_attention(const __half* Q, const __half* K, const 
         if (status != cudaSuccess) return status;
     }
     const int padded_d = ((d + kTileK - 1) / kTileK) * kTileK;
+    const std::size_t key_tiles = (static_cast<std::size_t>(N) - 1) / kBlockN + 1;
     fused_fp16_attention<<<query_tiles, kThreads, shared_bytes, stream>>>(
-        Q, K, V, O, M, N, d, padded_d, score_scale);
+        Q, K, V, O, M, N, d, padded_d, score_scale, routing, words_per_row, key_tiles);
     return cudaGetLastError();
 }

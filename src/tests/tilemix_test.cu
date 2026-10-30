@@ -171,6 +171,30 @@ void cpu_checks() {
     require(fused_fp16_shared_bytes(1) == 4608 && fused_fp16_shared_bytes(17) == 7168 &&
             fused_fp16_shared_bytes(128) == 22528 && fused_fp16_shared_bytes(129) == 0,
             "incorrect shared-memory footprint");
+    require(tilemix_routing_word_count(17, 2048, 1) == 2 &&
+            tilemix_routing_word_count(17, 2049, 1) == 4 &&
+            tilemix_routing_word_count(17, 4097, 2) == 4 &&
+            tilemix_routing_word_count(17, 4097, 1) == 6 &&
+            tilemix_routing_word_count(17, std::numeric_limits<int>::max(),
+                                      std::numeric_limits<int>::max()) == 2 &&
+            tilemix_routing_word_count(0, 1, 1) == 0 &&
+            tilemix_routing_word_count(1, 0, 1) == 0 &&
+            tilemix_routing_word_count(1, 1, 0) == 0,
+            "incorrect routing-mask footprint");
+    for (int group : {0, -1}) {
+        const TileMixRouting routing{nullptr, 0, group};
+        require(launch_fused_fp16_attention(&x, &x, &x, &out, 1, 1, 1, 1.0f,
+                                            nullptr, routing) == cudaErrorInvalidValue,
+                "nonpositive group size accepted");
+    }
+    const std::uint64_t word = 0;
+    for (const TileMixRouting routing : {TileMixRouting{nullptr, 1, 1},
+                                        TileMixRouting{&word, 0, 1},
+                                        TileMixRouting{&word, 3, 1}}) {
+        require(launch_fused_fp16_attention(&x, &x, &x, &out, 17, 2049, 1, 1.0f,
+                                            nullptr, routing) == cudaErrorInvalidValue,
+                "null or undersized routing mask accepted");
+    }
     std::puts("PASS TileMix FP16 API validation and workspace layout (no CUDA initialization)");
 
     for (const char* pattern : {"rising", "falling", "alternating", "late-extreme", "negative"}) {
@@ -293,6 +317,108 @@ void score_scale_checks() {
     }
 }
 
+void routing_case(const Shape& shape, int group_size, const char* pattern, bool trace = true) {
+    const size_t query_tiles = (shape.m + kBlockM - 1) / kBlockM;
+    const size_t key_tiles = (shape.n + kBlockN - 1) / kBlockN;
+    const size_t groups = (key_tiles + static_cast<size_t>(group_size) - 1) / group_size;
+    const size_t words_per_row = (groups + 63) / 64;
+    const bool implicit = std::string(pattern) == "implicit-fp16";
+    std::vector<std::uint64_t> words(query_tiles * words_per_row, ~std::uint64_t{0});
+    std::vector<std::uint8_t> expected_bits(query_tiles * key_tiles);
+    // Build logical group decisions first, then expand groups without n/g.
+    // Mixed words differ across rows AND consecutive 64-group chunks.
+    for (size_t row = 0; row < query_tiles; ++row) {
+        size_t tile = 0;
+        for (size_t group = 0; group < groups; ++group) {
+            const bool bit = std::string(pattern) == "int8-requested" ||
+                (std::string(pattern) == "mixed" && (group + row + group / 64) % 2 == 0);
+            const std::uint64_t flag = std::uint64_t{1} << (group % 64);
+            if (bit) words[row * words_per_row + group / 64] |= flag;
+            else words[row * words_per_row + group / 64] &= ~flag;
+            for (int repeat = 0; repeat < group_size && tile < key_tiles; ++repeat, ++tile) {
+                expected_bits[row * key_tiles + tile] = bit;
+            }
+        }
+    }
+    require(words.size() == tilemix_routing_word_count(shape.m, shape.n, group_size),
+            "routing layout disagrees with independent group packing");
+    auto data = inputs(shape);
+    const size_t count = data.q.size(), kv_count = data.k.size();
+    const size_t bytes = sizeof(__half) * (count + 2 * kv_count) + sizeof(float) * (count + 2)
+                       + words.size() * sizeof(std::uint64_t) + expected_bits.size() + 2;
+    size_t free_bytes, total_bytes;
+    cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes));
+    require(bytes <= free_bytes / 4 && bytes <= 64 * 1024 * 1024, "routing case exceeds VRAM budget");
+    std::vector<double> expected(count);
+    reference_attention(data.q.data(), data.k.data(), data.v.data(), expected.data(), shape.m, shape.n, shape.d);
+    constexpr float guard = -12345.25f;
+    std::vector<float> actual(count + 2, std::numeric_limits<float>::quiet_NaN());
+    actual.front() = actual.back() = guard;
+    constexpr std::uint8_t trace_guard = 0xa5;
+    std::vector<std::uint8_t> decoded(expected_bits.size() + 2, trace_guard);
+    DeviceArray<__half> q(count), k(kv_count), v(kv_count);
+    DeviceArray<float> output(actual.size());
+    DeviceArray<std::uint64_t> mask(words.size());
+    DeviceArray<std::uint8_t> bits(decoded.size());
+    Stream stream;
+    cuda_check(cudaMemcpyAsync(q.data, data.q.data(), count * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
+    cuda_check(cudaMemcpyAsync(k.data, data.k.data(), kv_count * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
+    cuda_check(cudaMemcpyAsync(v.data, data.v.data(), kv_count * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
+    cuda_check(cudaMemcpyAsync(mask.data, words.data(), words.size() * sizeof(std::uint64_t), cudaMemcpyHostToDevice, stream.value));
+    cuda_check(cudaMemcpyAsync(output.data, actual.data(), actual.size() * sizeof(float), cudaMemcpyHostToDevice, stream.value));
+    cuda_check(cudaMemcpyAsync(bits.data, decoded.data(), decoded.size(), cudaMemcpyHostToDevice, stream.value));
+    const float scale = 1.0f / std::sqrt(static_cast<float>(shape.d));
+    // Preserve an unmasked GPU result to catch any routing-induced sparsity.
+    std::vector<float> baseline(actual.size());
+    cuda_check(launch_fused_fp16_attention(q.data, k.data, v.data, output.data + 1,
+                                          shape.m, shape.n, shape.d, scale, stream.value));
+    cuda_check(cudaMemcpyAsync(baseline.data(), output.data, baseline.size() * sizeof(float), cudaMemcpyDeviceToHost, stream.value));
+    cuda_check(cudaStreamSynchronize(stream.value));
+    const TileMixRouting routing{implicit ? nullptr : mask.data, implicit ? 0 : words.size(), group_size,
+                                trace ? bits.data + 1 : nullptr};
+    cuda_check(launch_fused_fp16_attention(q.data, k.data, v.data, output.data + 1,
+                                          shape.m, shape.n, shape.d, scale, stream.value, routing));
+    cuda_check(cudaMemcpyAsync(actual.data(), output.data, actual.size() * sizeof(float), cudaMemcpyDeviceToHost, stream.value));
+    cuda_check(cudaMemcpyAsync(decoded.data(), bits.data, decoded.size(), cudaMemcpyDeviceToHost, stream.value));
+    cuda_check(cudaStreamSynchronize(stream.value));
+    require(actual.front() == guard && actual.back() == guard, "routed output guard overwritten");
+    require(std::memcmp(actual.data(), baseline.data(), actual.size() * sizeof(float)) == 0,
+            "routing changed FP16 fallback outputs or dense connectivity");
+    require(decoded.front() == trace_guard && decoded.back() == trace_guard, "routing trace guard overwritten");
+    for (size_t i = 0; i < expected_bits.size(); ++i) {
+        const std::uint8_t expected_bit = trace ? expected_bits[i] : trace_guard;
+        if (decoded[i + 1] != expected_bit) {
+            std::fprintf(stderr, "Routing mismatch row=%zu tile=%zu g=%d: got %u expected %u\n",
+                         i / key_tiles, i % key_tiles, group_size, decoded[i + 1], expected_bit);
+            throw std::runtime_error("device routing-bit decoding failed");
+        }
+    }
+    std::vector<std::uint64_t> mask_after(words.size());
+    cuda_check(cudaMemcpy(mask_after.data(), mask.data, mask_after.size() * sizeof(std::uint64_t), cudaMemcpyDeviceToHost));
+    require(mask_after == words, "routing mask modified by kernel");
+    std::printf("Routing M=%d N=%d d=%d g=%d words_per_row=%zu pattern=%s trace=%s\n",
+                shape.m, shape.n, shape.d, group_size, words_per_row, pattern, trace ? "yes" : "no");
+    compare(std::vector<float>(actual.begin() + 1, actual.end() - 1), expected,
+            "routing FP16 fallback vs CPU FP64", 1e-5, 1e-4);
+}
+
+void routing_checks() {
+    struct Case { Shape shape; int group; };
+    const Case cases[] = {{{35, 67, 17, "random"}, 2},
+        {{17, 2048, 5, "random"}, 1}, {{17, 2049, 5, "random"}, 1},
+        {{17, 4099, 5, "random"}, 2}, {{35, 163, 17, "random"}, 3},
+        {{17, 65, 17, "random"}, std::numeric_limits<int>::max()},
+        {{17, 4097, 3, "random"}, 1}};
+    for (const auto& test : cases) {
+        for (const char* pattern : {"fp16", "int8-requested", "mixed"}) {
+            routing_case(test.shape, test.group, pattern);
+        }
+    }
+    routing_case({17, 2051, 5, "random"}, 1, "implicit-fp16");
+    routing_case({35, 67, 17, "random"}, 2, "mixed", false);
+    std::puts("PASS 23 routing cases: group expansion, query rows, bit 63/64/127/128, partial tiles, null mask/trace");
+}
+
 void gpu_checks(std::ostream* fixtures) {
     int device, driver, runtime;
     cudaDeviceProp properties{};
@@ -324,6 +450,7 @@ void gpu_checks(std::ostream* fixtures) {
         ++reference_cases;
     }
     score_scale_checks();
+    routing_checks();
     std::printf("PASS TileMix FP16 suite: %d FP64-reference cases + 4 analytic scale/reuse cases\n", reference_cases);
 }
 }  // namespace
@@ -340,7 +467,7 @@ int main(int argc, char** argv) {
             fixtures.open(argv[2]);
             if (!fixtures) throw std::runtime_error("could not open JSON fixture file");
         }
-        std::puts("TileMix test scope: current FP16-input / FP32-state path; INT8 and mixed routing are unimplemented.");
+        std::puts("TileMix test scope: routing-mask decoding + FP16 fallback; INT8 arithmetic remains unimplemented.");
         cpu_checks();
         if (!cpu_only) gpu_checks(export_json ? &fixtures : nullptr);
         if (export_json) {
