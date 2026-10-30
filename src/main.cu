@@ -26,8 +26,11 @@ int main() {
         const std::size_t q_count = static_cast<std::size_t>(M) * d;
         const std::size_t kv_count = static_cast<std::size_t>(N) * d;
         const std::size_t word_count = tilemix_routing_word_count(M, N, group_size);
+        constexpr std::size_t q_blocks = (M - 1) / kTileMixQQuantRows + 1;
+        constexpr std::size_t k_blocks = (N - 1) / kTileMixKQuantRows + 1;
         const std::size_t bytes = sizeof(__half) * (q_count + 2 * kv_count)
-                                + sizeof(float) * q_count + sizeof(std::uint64_t) * word_count;
+                                + sizeof(float) * q_count + sizeof(std::uint64_t) * word_count
+                                + q_count + kv_count + sizeof(__half) * (q_blocks + k_blocks);
         std::size_t free_bytes, total_bytes;
         check(cudaMemGetInfo(&free_bytes, &total_bytes));
         if (bytes > free_bytes / 4) throw std::runtime_error("inputs exceed available VRAM budget");
@@ -40,6 +43,8 @@ int main() {
 
         DeviceBuffer<__half> dq(q_count), dk(kv_count), dv(kv_count);
         DeviceBuffer<float> result(q_count);
+        DeviceBuffer<std::int8_t> q8(q_count), k8(kv_count);
+        DeviceBuffer<__half> q_scales(q_blocks), k_scales(k_blocks);
         const std::vector<std::uint64_t> mask(word_count, UINT64_C(0xaaaaaaaaaaaaaaaa));
         DeviceBuffer<std::uint64_t> routing_words(word_count);
         check(cudaMemcpy(dq.data, q.data(), q_count * sizeof(__half), cudaMemcpyHostToDevice));
@@ -47,12 +52,14 @@ int main() {
         check(cudaMemcpy(dv.data, v.data(), kv_count * sizeof(__half), cudaMemcpyHostToDevice));
         check(cudaMemcpy(routing_words.data, mask.data(), word_count * sizeof(std::uint64_t), cudaMemcpyHostToDevice));
         const TileMixRouting routing{routing_words.data, word_count, group_size};
+        check(quantize_tilemix_qk(dq.data, dk.data, q8.data, k8.data, q_scales.data, k_scales.data, M, N, d));
+        const TileMixQuantized quantized{q8.data, k8.data, q_scales.data, k_scales.data};
         check(launch_fused_fp16_attention(dq.data, dk.data, dv.data, result.data,
-                                         M, N, d, 1.0f / std::sqrt(static_cast<float>(d)), nullptr, routing));
+                                         M, N, d, 1.0f / std::sqrt(static_cast<float>(d)), nullptr, routing, quantized));
         check(cudaDeviceSynchronize());
         check(cudaMemcpy(output.data(), result.data, q_count * sizeof(float), cudaMemcpyDeviceToHost));
-        std::printf("FP16 attention: M=%d N=%d d=%d output[0]=%.9g\n", M, N, d, output[0]);
-        std::printf("Routing: %d key tiles/group, %zu packed words; INT8 requests use FP16 fallback\n",
+        std::printf("TileMix attention: M=%d N=%d d=%d output[0]=%.9g\n", M, N, d, output[0]);
+        std::printf("Routing: %d key tiles/group, %zu packed words; bit 0=FP16, bit 1=INT8 WMMA\n",
                     group_size, word_count);
         return 0;
     } catch (const std::exception& error) {

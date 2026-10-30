@@ -1,5 +1,6 @@
 #include "attention_fused.h"
 #include "reference_attention.h"
+#include "reference_tilemix.h"
 
 #include <algorithm>
 #include <cmath>
@@ -59,6 +60,20 @@ Inputs inputs(const Shape& shape) {
         return result;
     }
     if (pattern == "random") return result;
+    if (pattern == "block-outliers") {
+        require(m >= 129 && n >= 129, "block-outlier fixture requires two quantization blocks");
+        result.q[static_cast<size_t>(127) * d] = __float2half(8.0f);
+        result.q[static_cast<size_t>(128) * d] = __float2half(0.125f);
+        result.k[static_cast<size_t>(63) * d] = __float2half(-16.0f);
+        result.k[static_cast<size_t>(128) * d] = __float2half(0.25f);
+        return result;
+    }
+    if (pattern == "max-int8") {
+        std::fill(result.q.begin(), result.q.end(), __float2half(1.0f));
+        std::fill(result.k.begin(), result.k.end(), __float2half(1.0f));
+        std::fill(result.k.begin(), result.k.begin() + d, __float2half(-1.0f));
+        return result;
+    }
     if (pattern == "zero-v") {
         std::fill(result.v.begin(), result.v.end(), __float2half(0.0f));
         return result;
@@ -171,6 +186,25 @@ void cpu_checks() {
     require(fused_fp16_shared_bytes(1) == 4608 && fused_fp16_shared_bytes(17) == 7168 &&
             fused_fp16_shared_bytes(128) == 22528 && fused_fp16_shared_bytes(129) == 0,
             "incorrect shared-memory footprint");
+    require(kTileMixQQuantRows == 128 && kTileMixKQuantRows == 64 &&
+            tilemix_shared_bytes(128, true) == 28672 && tilemix_shared_bytes(17, true) == 8704,
+            "incorrect quantization blocks or shared layout");
+    std::int8_t byte = 0;
+    __half scale_output;
+    require(quantize_tilemix_qk(nullptr, &x, &byte, &byte, &scale_output, &scale_output,
+                               1, 1, 1) == cudaErrorInvalidValue, "null quantizer input accepted");
+    require(quantize_tilemix_qk(&x, &x, nullptr, &byte, &scale_output, &scale_output,
+                               1, 1, 1) == cudaErrorInvalidValue, "null quantizer output accepted");
+    require(quantize_tilemix_qk(&x, &x, &byte, &byte, nullptr, &scale_output,
+                               1, 1, 1) == cudaErrorInvalidValue, "null scale output accepted");
+    require(quantize_tilemix_qk(&x, &x, &byte, &byte, &scale_output, &scale_output,
+                               0, 1, 1) == cudaErrorInvalidValue, "empty quantizer input accepted");
+    require(quantize_tilemix_qk(&x, &x, &byte, &byte, &scale_output, &scale_output,
+                               1, 1, 129) == cudaErrorNotSupported, "unsupported quantizer d accepted");
+    const TileMixQuantized partial{&byte};
+    require(launch_fused_fp16_attention(&x, &x, &x, &out, 1, 1, 1, 1.0f,
+                                       nullptr, {}, partial) == cudaErrorInvalidValue,
+            "partial quantized inputs accepted");
     require(tilemix_routing_word_count(17, 2048, 1) == 2 &&
             tilemix_routing_word_count(17, 2049, 1) == 4 &&
             tilemix_routing_word_count(17, 4097, 2) == 4 &&
@@ -188,6 +222,9 @@ void cpu_checks() {
                 "nonpositive group size accepted");
     }
     const std::uint64_t word = 0;
+    require(launch_fused_fp16_attention(&x, &x, &x, &out, 1, 1, 1, 1.0f,
+                                       nullptr, TileMixRouting{&word, 1, 1}) == cudaErrorInvalidValue,
+            "routed attention accepted missing quantized operands");
     for (const TileMixRouting routing : {TileMixRouting{nullptr, 1, 1},
                                         TileMixRouting{&word, 0, 1},
                                         TileMixRouting{&word, 3, 1}}) {
@@ -317,11 +354,80 @@ void score_scale_checks() {
     }
 }
 
+template <class T>
+void same_device_bytes(const T* device, const std::vector<T>& expected, const char* label) {
+    std::vector<T> actual(expected.size());
+    cuda_check(cudaMemcpy(actual.data(), device, actual.size() * sizeof(T), cudaMemcpyDeviceToHost));
+    require(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(T)) == 0, label);
+}
+
+void quantization_checks() {
+    struct Case { int m, n, d; const char* pattern; };
+    const Case cases[] = {{129, 65, 17, "zeros"}, {129, 65, 1, "rounding"},
+        {129, 65, 3, "tiny"}, {3, 5, 128, "max-range"},
+        {137, 73, 31, "random"}, {129, 131, 17, "block-outliers"}};
+    for (const auto& test : cases) {
+        const std::string pattern = test.pattern;
+        auto data = inputs({test.m, test.n, test.d, pattern == "block-outliers" ? "block-outliers" : "random"});
+        for (auto* values : {&data.q, &data.k}) {
+            for (size_t i = 0; i < values->size(); ++i) {
+                if (pattern == "zeros") (*values)[i] = __float2half(0.0f);
+                if (pattern == "rounding") {
+                    const float values_at_ties[] = {127, -127, 0.5f, -0.5f, 1.5f, -1.5f, 126.5f, -126.5f};
+                    (*values)[i] = __float2half(values_at_ties[i % 8]);
+                }
+                if (pattern == "tiny") (*values)[i] = __float2half(std::ldexp(i % 2 ? -1.0f : 1.0f, -24));
+                if (pattern == "max-range") (*values)[i] = __float2half(i % 2 ? -65504.0f : 65504.0f);
+            }
+        }
+        const auto q_ref = reference_quantize(data.q, test.m, test.d, 128);
+        const auto k_ref = reference_quantize(data.k, test.n, test.d, 64);
+        if (pattern == "rounding") {
+            const std::int8_t known[] = {127, -127, 1, -1, 2, -2, 127, -127};
+            require(std::equal(std::begin(known), std::end(known), q_ref.values.begin()), "CPU rounding oracle failed ties");
+        }
+        const size_t bytes = 3 * (data.q.size() + data.k.size())
+                           + 2 * (q_ref.scales.size() + k_ref.scales.size()) + 12;
+        size_t free_bytes, total_bytes;
+        cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes));
+        require(bytes <= free_bytes / 4 && bytes <= 64 * 1024 * 1024, "quantizer exceeds VRAM budget");
+        std::vector<std::int8_t> q_expected(data.q.size() + 2, -128), k_expected(data.k.size() + 2, -128);
+        std::copy(q_ref.values.begin(), q_ref.values.end(), q_expected.begin() + 1);
+        std::copy(k_ref.values.begin(), k_ref.values.end(), k_expected.begin() + 1);
+        std::vector<__half> qs_expected(q_ref.scales.size() + 2, __float2half(60000.0f));
+        std::vector<__half> ks_expected(k_ref.scales.size() + 2, __float2half(60000.0f));
+        std::copy(q_ref.scales.begin(), q_ref.scales.end(), qs_expected.begin() + 1);
+        std::copy(k_ref.scales.begin(), k_ref.scales.end(), ks_expected.begin() + 1);
+        DeviceArray<__half> q(data.q.size()), k(data.k.size()), qs(qs_expected.size()), ks(ks_expected.size());
+        DeviceArray<std::int8_t> q8(q_expected.size()), k8(k_expected.size());
+        Stream stream;
+        cuda_check(cudaMemcpyAsync(q.data, data.q.data(), data.q.size() * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
+        cuda_check(cudaMemcpyAsync(k.data, data.k.data(), data.k.size() * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
+        cuda_check(cudaMemsetAsync(q8.data, 0x80, q_expected.size(), stream.value));
+        cuda_check(cudaMemsetAsync(k8.data, 0x80, k_expected.size(), stream.value));
+        const std::vector<__half> scale_guard(std::max(qs_expected.size(), ks_expected.size()), __float2half(60000.0f));
+        cuda_check(cudaMemcpyAsync(qs.data, scale_guard.data(), qs_expected.size() * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
+        cuda_check(cudaMemcpyAsync(ks.data, scale_guard.data(), ks_expected.size() * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
+        cuda_check(quantize_tilemix_qk(q.data, k.data, q8.data + 1, k8.data + 1, qs.data + 1, ks.data + 1,
+                                      test.m, test.n, test.d, stream.value));
+        cuda_check(cudaStreamSynchronize(stream.value));
+        same_device_bytes(q8.data, q_expected, "quantized Q bytes / guards mismatch");
+        same_device_bytes(k8.data, k_expected, "quantized K bytes / guards mismatch");
+        same_device_bytes(qs.data, qs_expected, "quantized Q scales / guards mismatch");
+        same_device_bytes(ks.data, ks_expected, "quantized K scales / guards mismatch");
+        same_device_bytes(q.data, data.q, "quantizer modified Q");
+        same_device_bytes(k.data, data.k, "quantizer modified K");
+        std::printf("PASS quantization M=%d N=%d d=%d pattern=%s exact bytes/scales/guards\n", test.m, test.n, test.d, test.pattern);
+    }
+}
+
 void routing_case(const Shape& shape, int group_size, const char* pattern, bool trace = true) {
     const size_t query_tiles = (shape.m + kBlockM - 1) / kBlockM;
     const size_t key_tiles = (shape.n + kBlockN - 1) / kBlockN;
     const size_t groups = (key_tiles + static_cast<size_t>(group_size) - 1) / group_size;
     const size_t words_per_row = (groups + 63) / 64;
+    std::printf("Routing M=%d N=%d d=%d g=%d words_per_row=%zu pattern=%s trace=%s\n",
+                shape.m, shape.n, shape.d, group_size, words_per_row, pattern, trace ? "yes" : "no");
     const bool implicit = std::string(pattern) == "implicit-fp16";
     std::vector<std::uint64_t> words(query_tiles * words_per_row, ~std::uint64_t{0});
     std::vector<std::uint8_t> expected_bits(query_tiles * key_tiles);
@@ -344,8 +450,13 @@ void routing_case(const Shape& shape, int group_size, const char* pattern, bool 
             "routing layout disagrees with independent group packing");
     auto data = inputs(shape);
     const size_t count = data.q.size(), kv_count = data.k.size();
+    const auto q8_ref = reference_quantize(data.q, shape.m, shape.d, 128);
+    const auto k8_ref = reference_quantize(data.k, shape.n, shape.d, 64);
+    const size_t score_count = static_cast<size_t>(shape.m) * shape.n;
     const size_t bytes = sizeof(__half) * (count + 2 * kv_count) + sizeof(float) * (count + 2)
-                       + words.size() * sizeof(std::uint64_t) + expected_bits.size() + 2;
+                       + words.size() * sizeof(std::uint64_t) + expected_bits.size() + 2
+                       + count + kv_count + sizeof(__half) * (q8_ref.scales.size() + k8_ref.scales.size())
+                       + sizeof(std::int32_t) * (score_count + 2);
     size_t free_bytes, total_bytes;
     cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes));
     require(bytes <= free_bytes / 4 && bytes <= 64 * 1024 * 1024, "routing case exceeds VRAM budget");
@@ -360,15 +471,23 @@ void routing_case(const Shape& shape, int group_size, const char* pattern, bool 
     DeviceArray<float> output(actual.size());
     DeviceArray<std::uint64_t> mask(words.size());
     DeviceArray<std::uint8_t> bits(decoded.size());
-    Stream stream;
+    DeviceArray<std::int8_t> q8(count), k8(kv_count);
+    DeviceArray<__half> q_scales(q8_ref.scales.size()), k_scales(k8_ref.scales.size());
+    constexpr std::int32_t dot_guard = 0x2468ace;
+    std::vector<std::int32_t> dots(score_count + 2, dot_guard);
+    DeviceArray<std::int32_t> raw_dots(dots.size());
+    Stream stream(shape.default_stream);
     cuda_check(cudaMemcpyAsync(q.data, data.q.data(), count * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
     cuda_check(cudaMemcpyAsync(k.data, data.k.data(), kv_count * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
     cuda_check(cudaMemcpyAsync(v.data, data.v.data(), kv_count * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
     cuda_check(cudaMemcpyAsync(mask.data, words.data(), words.size() * sizeof(std::uint64_t), cudaMemcpyHostToDevice, stream.value));
     cuda_check(cudaMemcpyAsync(output.data, actual.data(), actual.size() * sizeof(float), cudaMemcpyHostToDevice, stream.value));
     cuda_check(cudaMemcpyAsync(bits.data, decoded.data(), decoded.size(), cudaMemcpyHostToDevice, stream.value));
+    cuda_check(cudaMemcpyAsync(raw_dots.data, dots.data(), dots.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream.value));
+    cuda_check(quantize_tilemix_qk(q.data, k.data, q8.data, k8.data, q_scales.data, k_scales.data,
+                                  shape.m, shape.n, shape.d, stream.value));
     const float scale = 1.0f / std::sqrt(static_cast<float>(shape.d));
-    // Preserve an unmasked GPU result to catch any routing-induced sparsity.
+    // All-FP16 masks must preserve the original GPU result exactly.
     std::vector<float> baseline(actual.size());
     cuda_check(launch_fused_fp16_attention(q.data, k.data, v.data, output.data + 1,
                                           shape.m, shape.n, shape.d, scale, stream.value));
@@ -376,14 +495,29 @@ void routing_case(const Shape& shape, int group_size, const char* pattern, bool 
     cuda_check(cudaStreamSynchronize(stream.value));
     const TileMixRouting routing{implicit ? nullptr : mask.data, implicit ? 0 : words.size(), group_size,
                                 trace ? bits.data + 1 : nullptr};
+    const TileMixQuantized quantized{q8.data, k8.data, q_scales.data, k_scales.data, raw_dots.data + 1};
     cuda_check(launch_fused_fp16_attention(q.data, k.data, v.data, output.data + 1,
-                                          shape.m, shape.n, shape.d, scale, stream.value, routing));
+                                          shape.m, shape.n, shape.d, scale, stream.value, routing, quantized));
     cuda_check(cudaMemcpyAsync(actual.data(), output.data, actual.size() * sizeof(float), cudaMemcpyDeviceToHost, stream.value));
     cuda_check(cudaMemcpyAsync(decoded.data(), bits.data, decoded.size(), cudaMemcpyDeviceToHost, stream.value));
+    cuda_check(cudaMemcpyAsync(dots.data(), raw_dots.data, dots.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream.value));
     cuda_check(cudaStreamSynchronize(stream.value));
     require(actual.front() == guard && actual.back() == guard, "routed output guard overwritten");
-    require(std::memcmp(actual.data(), baseline.data(), actual.size() * sizeof(float)) == 0,
-            "routing changed FP16 fallback outputs or dense connectivity");
+    if (std::none_of(expected_bits.begin(), expected_bits.end(), [](auto bit) { return bit != 0; })) {
+        require(std::memcmp(actual.data(), baseline.data(), actual.size() * sizeof(float)) == 0,
+                "all-FP16 routing changed baseline outputs");
+    }
+    require(dots.front() == dot_guard && dots.back() == dot_guard, "INT32 dot guard overwritten");
+    for (int query = 0; query < shape.m; ++query) {
+        for (int key = 0; key < shape.n; ++key) {
+            const bool int8 = expected_bits[static_cast<size_t>(query / kBlockM) * key_tiles + key / kBlockN];
+            const auto expected_dot = int8 ? reference_int8_dot(q8_ref, k8_ref, query, key, shape.d) : dot_guard;
+            if (dots[static_cast<size_t>(query) * shape.n + key + 1] != expected_dot) {
+                std::fprintf(stderr, "INT32 dot mismatch query=%d key=%d\n", query, key);
+                throw std::runtime_error("signed INT8 WMMA dot mismatch");
+            }
+        }
+    }
     require(decoded.front() == trace_guard && decoded.back() == trace_guard, "routing trace guard overwritten");
     for (size_t i = 0; i < expected_bits.size(); ++i) {
         const std::uint8_t expected_bit = trace ? expected_bits[i] : trace_guard;
@@ -396,10 +530,23 @@ void routing_case(const Shape& shape, int group_size, const char* pattern, bool 
     std::vector<std::uint64_t> mask_after(words.size());
     cuda_check(cudaMemcpy(mask_after.data(), mask.data, mask_after.size() * sizeof(std::uint64_t), cudaMemcpyDeviceToHost));
     require(mask_after == words, "routing mask modified by kernel");
-    std::printf("Routing M=%d N=%d d=%d g=%d words_per_row=%zu pattern=%s trace=%s\n",
-                shape.m, shape.n, shape.d, group_size, words_per_row, pattern, trace ? "yes" : "no");
-    compare(std::vector<float>(actual.begin() + 1, actual.end() - 1), expected,
-            "routing FP16 fallback vs CPU FP64", 1e-5, 1e-4);
+    same_device_bytes(q8.data, q8_ref.values, "Q8 quantization/immutability mismatch");
+    same_device_bytes(k8.data, k8_ref.values, "K8 quantization/immutability mismatch");
+    same_device_bytes(q_scales.data, q8_ref.scales, "Q scale mismatch");
+    same_device_bytes(k_scales.data, k8_ref.scales, "K scale mismatch");
+    const auto mixed_expected = reference_tilemix(data.q, data.k, data.v, q8_ref, k8_ref, expected_bits,
+                                                 shape.m, shape.n, shape.d, kBlockM, kBlockN, scale);
+    compare(std::vector<float>(actual.begin() + 1, actual.end() - 1), mixed_expected,
+            "mixed FP16/INT8 vs independent semantic oracle", 1e-5, 1e-4);
+    double max_abs = 0.0, max_rel = 0.0, squared = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        const double error = std::fabs(actual[i + 1] - expected[i]);
+        max_abs = std::max(max_abs, error);
+        max_rel = std::max(max_rel, error / std::max(std::fabs(expected[i]), 1e-5));
+        squared += error * error;
+    }
+    std::printf("Approximation vs dense FP16-input oracle (reported only): max_abs_error=%.9g "
+                "max_rel_error=%.9g rms_error=%.9g\n", max_abs, max_rel, std::sqrt(squared / count));
 }
 
 void routing_checks() {
@@ -408,15 +555,26 @@ void routing_checks() {
         {{17, 2048, 5, "random"}, 1}, {{17, 2049, 5, "random"}, 1},
         {{17, 4099, 5, "random"}, 2}, {{35, 163, 17, "random"}, 3},
         {{17, 65, 17, "random"}, std::numeric_limits<int>::max()},
-        {{17, 4097, 3, "random"}, 1}};
+        {{17, 4097, 3, "random"}, 1}, {{129, 131, 17, "block-outliers", true}, 1},
+        {{17, 65, 17, "zeros"}, 2}, {{17, 65, 1, "rising"}, 1},
+        {{17, 65, 1, "falling"}, 1}, {{17, 129, 1, "alternating"}, 1},
+        {{17, 65, 1, "late-extreme"}, 1}, {{17, 33, 128, "max-int8"}, 1}};
+    int checked = 0;
     for (const auto& test : cases) {
         for (const char* pattern : {"fp16", "int8-requested", "mixed"}) {
             routing_case(test.shape, test.group, pattern);
+            ++checked;
+        }
+    }
+    for (int d : {1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128}) {
+        for (const char* pattern : {"fp16", "int8-requested", "mixed"}) {
+            routing_case({3, 33, d, "random"}, 1, pattern);
+            ++checked;
         }
     }
     routing_case({17, 2051, 5, "random"}, 1, "implicit-fp16");
     routing_case({35, 67, 17, "random"}, 2, "mixed", false);
-    std::puts("PASS 23 routing cases: group expansion, query rows, bit 63/64/127/128, partial tiles, null mask/trace");
+    std::printf("PASS %d routing cases: exact signed INT8 dots, block scales, mixed online-softmax state and mask decoding\n", checked + 2);
 }
 
 void gpu_checks(std::ostream* fixtures) {
@@ -450,6 +608,7 @@ void gpu_checks(std::ostream* fixtures) {
         ++reference_cases;
     }
     score_scale_checks();
+    quantization_checks();
     routing_checks();
     std::printf("PASS TileMix FP16 suite: %d FP64-reference cases + 4 analytic scale/reuse cases\n", reference_cases);
 }
@@ -467,7 +626,7 @@ int main(int argc, char** argv) {
             fixtures.open(argv[2]);
             if (!fixtures) throw std::runtime_error("could not open JSON fixture file");
         }
-        std::puts("TileMix test scope: routing-mask decoding + FP16 fallback; INT8 arithmetic remains unimplemented.");
+        std::puts("TileMix tests: FP16/INT8 score paths, 128/64-row Q/K quantization, shared FP32 softmax state.");
         cpu_checks();
         if (!cpu_only) gpu_checks(export_json ? &fixtures : nullptr);
         if (export_json) {
