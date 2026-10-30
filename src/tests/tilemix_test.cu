@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -28,10 +29,14 @@ template <class T> struct DeviceArray {
 };
 struct Stream {
     cudaStream_t value = nullptr;
-    Stream() { cuda_check(cudaStreamCreateWithFlags(&value, cudaStreamNonBlocking)); }
+    explicit Stream(bool default_stream = false) {
+        if (!default_stream) cuda_check(cudaStreamCreateWithFlags(&value, cudaStreamNonBlocking));
+    }
     ~Stream() { if (value) cudaStreamDestroy(value); }
+    Stream(const Stream&) = delete;
+    Stream& operator=(const Stream&) = delete;
 };
-struct Shape { int m, n, d; const char* pattern; };
+struct Shape { int m, n, d; const char* pattern; bool default_stream = false; };
 struct Inputs { std::vector<__half> q, k, v; };
 
 Inputs inputs(const Shape& shape) {
@@ -54,12 +59,31 @@ Inputs inputs(const Shape& shape) {
         return result;
     }
     if (pattern == "random") return result;
+    if (pattern == "zero-v") {
+        std::fill(result.v.begin(), result.v.end(), __float2half(0.0f));
+        return result;
+    }
     if (pattern == "constant-v") {
         for (int key = 0; key < n; ++key) {
             for (int f = 0; f < d; ++f) {
                 result.v[static_cast<size_t>(key) * d + f] = __float2half((f % 7 - 3) * 0.25f);
             }
         }
+        return result;
+    }
+    if (pattern == "cancellation") {
+        std::fill(result.q.begin(), result.q.end(), __float2half(0.0f));
+        for (int key = 0; key < n; ++key) {
+            for (int f = 0; f < d; ++f) {
+                result.v[static_cast<size_t>(key) * d + f] = __float2half(key % 2 ? -1.0f : 1.0f);
+            }
+        }
+        return result;
+    }
+    if (pattern == "large-dot") {
+        std::fill(result.q.begin(), result.q.end(), __float2half(1000.0f));
+        std::fill(result.k.begin(), result.k.end(), __float2half(-1000.0f));
+        std::fill(result.k.begin(), result.k.begin() + d, __float2half(1000.0f));
         return result;
     }
     std::fill(result.q.begin(), result.q.end(), __float2half(0.0f));
@@ -105,7 +129,7 @@ void compare(const std::vector<T>& actual, const std::vector<double>& expected,
             error > atol + rtol * std::fabs(expected[i])) {
             std::fprintf(stderr, "%s mismatch at %zu: got %.17g expected %.17g\n",
                          label, i, static_cast<double>(actual[i]), expected[i]);
-            throw std::runtime_error("fused attention comparison failed");
+            throw std::runtime_error("TileMix FP16 comparison failed");
         }
         max_abs = std::max(max_abs, error);
         max_rel = std::max(max_rel, error / std::max(std::fabs(expected[i]), atol));
@@ -134,8 +158,10 @@ void cpu_checks() {
         require(launch_fused_fp16_attention(&x, &x, &x, &out, 1, 1, dimension, 1.0f) == cudaErrorInvalidValue,
                 "invalid d accepted");
     }
-    require(launch_fused_fp16_attention(&x, &x, &x, &out, 1, 1, 129, 1.0f) == cudaErrorNotSupported,
-            "unsupported head dimension accepted");
+    for (int d : {129, std::numeric_limits<int>::max()}) {
+        require(launch_fused_fp16_attention(&x, &x, &x, &out, 1, 1, d, 1.0f) == cudaErrorNotSupported,
+                "unsupported head dimension accepted");
+    }
     for (float scale : {std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::infinity(),
                         -std::numeric_limits<float>::infinity()}) {
@@ -145,7 +171,7 @@ void cpu_checks() {
     require(fused_fp16_shared_bytes(1) == 4608 && fused_fp16_shared_bytes(17) == 7168 &&
             fused_fp16_shared_bytes(128) == 22528 && fused_fp16_shared_bytes(129) == 0,
             "incorrect shared-memory footprint");
-    std::puts("PASS CPU fused API validation and workspace layout (no CUDA initialization)");
+    std::puts("PASS TileMix FP16 API validation and workspace layout (no CUDA initialization)");
 
     for (const char* pattern : {"rising", "falling", "alternating", "late-extreme", "negative"}) {
         const Shape shape{17, std::string(pattern) == "alternating" ? 129 : 65, 1, pattern};
@@ -188,8 +214,8 @@ void gpu_case(const Shape& shape, std::ostream* fixtures) {
     guarded.front() = guarded.back() = guard;
     DeviceArray<__half> q(count), k(kv_count), v(kv_count);
     DeviceArray<float> output(count + 2);
-    Stream stream;
-    // Copies and kernel share a nonblocking stream; no default-stream ordering is assumed.
+    Stream stream(shape.default_stream);
+    // Copies and the kernel share the caller's stream.
     cuda_check(cudaMemcpyAsync(q.data, data.q.data(), count * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
     cuda_check(cudaMemcpyAsync(k.data, data.k.data(), kv_count * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
     cuda_check(cudaMemcpyAsync(v.data, data.v.data(), kv_count * sizeof(__half), cudaMemcpyHostToDevice, stream.value));
@@ -200,13 +226,21 @@ void gpu_case(const Shape& shape, std::ostream* fixtures) {
     cuda_check(cudaMemcpy(guarded.data(), output.data, guarded.size() * sizeof(float), cudaMemcpyDeviceToHost));
     require(guarded.front() == guard && guarded.back() == guard, "output guard overwritten");
     std::printf("Case M=%d N=%d d=%d pattern=%s tile=%dx%d threads=%d shared_bytes=%zu "
-                "nonblocking-stream FP16_QKV FP32_O\n", shape.m, shape.n, shape.d, shape.pattern,
-                kBlockM, kBlockN, kThreads, fused_fp16_shared_bytes(shape.d));
+                "stream=%s FP16_QKV FP32_state_O\n", shape.m, shape.n, shape.d, shape.pattern,
+                kBlockM, kBlockN, kThreads, fused_fp16_shared_bytes(shape.d),
+                shape.default_stream ? "default" : "nonblocking");
     compare(std::vector<float>(guarded.begin() + 1, guarded.end() - 1), expected,
-            "CUDA fused vs FP64", 1e-5, 1e-4);
+            "TileMix FP16 vs CPU FP64", 1e-5, 1e-4);
+    const auto unchanged = [](const __half* device, const std::vector<__half>& original) {
+        std::vector<__half> actual(original.size());
+        cuda_check(cudaMemcpy(actual.data(), device, actual.size() * sizeof(__half), cudaMemcpyDeviceToHost));
+        require(std::memcmp(actual.data(), original.data(), actual.size() * sizeof(__half)) == 0,
+                "kernel modified a Q/K/V input");
+    };
+    unchanged(q.data, data.q);
+    unchanged(k.data, data.k);
+    unchanged(v.data, data.v);
     if (fixtures) {
-        // Decimal FP32 max_digits10 preserves every rounded FP16 input and
-        // every FP32 output on a JSON round trip to an independent oracle.
         auto& out = *fixtures;
         out << std::setprecision(std::numeric_limits<float>::max_digits10)
             << "{\"m\":" << shape.m << ",\"n\":" << shape.n << ",\"d\":" << shape.d
@@ -232,6 +266,33 @@ void gpu_case(const Shape& shape, std::ostream* fixtures) {
     }
 }
 
+void score_scale_checks() {
+    const __half q[] = {__float2half(1.0f)};
+    const __half k[] = {__float2half(-1.0f), __float2half(0.0f), __float2half(1.0f)};
+    const __half v[] = {__float2half(2.0f), __float2half(4.0f), __float2half(8.0f)};
+    constexpr float guard = -12345.25f;
+    float actual[] = {guard, std::numeric_limits<float>::quiet_NaN(), guard};
+    DeviceArray<__half> dq(1), dk(3), dv(3);
+    DeviceArray<float> output(3);
+    Stream stream;
+    cuda_check(cudaMemcpyAsync(dq.data, q, sizeof(q), cudaMemcpyHostToDevice, stream.value));
+    cuda_check(cudaMemcpyAsync(dk.data, k, sizeof(k), cudaMemcpyHostToDevice, stream.value));
+    cuda_check(cudaMemcpyAsync(dv.data, v, sizeof(v), cudaMemcpyHostToDevice, stream.value));
+    cuda_check(cudaMemcpyAsync(output.data, actual, sizeof(actual), cudaMemcpyHostToDevice, stream.value));
+    for (float scale : {1.0f, 0.0f, -1.0f, 0.5f}) {
+        cuda_check(launch_fused_fp16_attention(dq.data, dk.data, dv.data, output.data + 1,
+                                              1, 3, 1, scale, stream.value));
+        cuda_check(cudaMemcpyAsync(actual, output.data, sizeof(actual), cudaMemcpyDeviceToHost, stream.value));
+        cuda_check(cudaStreamSynchronize(stream.value));
+        require(actual[0] == guard && actual[2] == guard, "output guard overwritten on reuse");
+        const double a = std::exp(-static_cast<double>(scale)), b = std::exp(static_cast<double>(scale));
+        const double expected = (2.0 * a + 4.0 + 8.0 * b) / (a + 1.0 + b);
+        std::printf("Case score_scale=%.2g reused_device_buffers\n", scale);
+        compare(std::vector<float>{actual[1]}, std::vector<double>{expected},
+                "TileMix FP16 analytic scale / reuse", 1e-5, 1e-4);
+    }
+}
+
 void gpu_checks(std::ostream* fixtures) {
     int device, driver, runtime;
     cudaDeviceProp properties{};
@@ -243,14 +304,27 @@ void gpu_checks(std::ostream* fixtures) {
     cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes));
     std::printf("GPU=%s cc=%d.%d free_bytes=%zu total_bytes=%zu driver=%d runtime=%d\n",
                 properties.name, properties.major, properties.minor, free_bytes, total_bytes, driver, runtime);
-    for (int d : {1, 17, 33, 49, 65, 81, 97, 113, 128}) gpu_case({3, 33, d, "random"}, fixtures);
-    const Shape cases[] = {{1, 1, 1, "random"}, {17, 33, 17, "random"},
+    int reference_cases = 0;
+    for (int d : {1, 15, 16, 17, 31, 32, 33, 49, 63, 64, 65, 81, 97, 113, 127, 128}) {
+        gpu_case({3, 33, d, "random"}, fixtures);
+        ++reference_cases;
+    }
+    const Shape cases[] = {{1, 1, 1, "random"}, {3, 5, 7, "random"},
+        {15, 31, 15, "random"}, {16, 32, 16, "random"}, {17, 33, 17, "random"},
+        {31, 63, 31, "random"}, {32, 64, 32, "random"}, {33, 65, 33, "random"},
         {35, 67, 65, "random"}, {17, 65, 128, "random"},
+        {17, 1, 128, "random"}, {17, 33, 17, "random", true},
         {17, 65, 1, "rising"}, {17, 65, 1, "falling"}, {17, 129, 1, "alternating"},
         {17, 65, 1, "late-extreme"}, {17, 33, 1, "negative"},
-        {17, 33, 17, "zeros"}, {17, 65, 17, "constant-v"},
+        {17, 33, 17, "zeros"}, {17, 33, 17, "uniform"}, {17, 33, 17, "zero-v"},
+        {17, 65, 17, "constant-v"}, {2, 32, 17, "cancellation"}, {17, 33, 1, "large-dot"},
         {3, 2051, 17, "random"}, {1, 4097, 128, "uniform"}};
-    for (const auto& shape : cases) gpu_case(shape, fixtures);
+    for (const auto& shape : cases) {
+        gpu_case(shape, fixtures);
+        ++reference_cases;
+    }
+    score_scale_checks();
+    std::printf("PASS TileMix FP16 suite: %d FP64-reference cases + 4 analytic scale/reuse cases\n", reference_cases);
 }
 }  // namespace
 
@@ -259,13 +333,14 @@ int main(int argc, char** argv) {
         const bool cpu_only = argc == 2 && std::string(argv[1]) == "--cpu-only";
         const bool export_json = argc == 3 && std::string(argv[1]) == "--export-json";
         if (argc != 1 && !cpu_only && !export_json) {
-            throw std::invalid_argument("usage: fused_attention_test [--cpu-only | --export-json FILE]");
+            throw std::invalid_argument("usage: tilemix_test [--cpu-only | --export-json FILE]");
         }
         std::ofstream fixtures;
         if (export_json) {
             fixtures.open(argv[2]);
             if (!fixtures) throw std::runtime_error("could not open JSON fixture file");
         }
+        std::puts("TileMix test scope: current FP16-input / FP32-state path; INT8 and mixed routing are unimplemented.");
         cpu_checks();
         if (!cpu_only) gpu_checks(export_json ? &fixtures : nullptr);
         if (export_json) {
