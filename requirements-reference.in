@@ -1,4 +1,2 @@
-# CPU oracle only; retain the PyTorch version used for the initial validation.
-# Native CUDA kernels are built separately with nvcc.
 torch==2.3.0+cpu
 numpy==1.26.4

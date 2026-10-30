@@ -1,7 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
 
-# Build both the research target and local development target by default.
-# Set this before project() so CUDA compiler detection uses the same targets.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 80 89 CACHE STRING "CUDA architectures")
 endif()
