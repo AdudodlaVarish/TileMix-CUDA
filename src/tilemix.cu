@@ -30,8 +30,6 @@ __global__ void fused_fp16_attention(const __half* Q, const __half* K, const __h
     const std::size_t query = query_begin + local_query;
     const bool query_valid = query < static_cast<std::size_t>(M);
 
-    // After the WMMA phase, four threads own each query row. Each thread owns
-    // features row_lane + 4*slot, with up to 32 FP32 output accumulators.
     constexpr int kOutputSlots = kFusedMaxHeadDim / kFusedRowThreads;
     constexpr int kScoreSlots = kBlockN / kFusedRowThreads;
     float output[kOutputSlots];
@@ -68,8 +66,7 @@ __global__ void fused_fp16_attention(const __half* Q, const __half* K, const __h
                 wmma::load_matrix_sync(b, k_tile + warp_key_begin * padded_d + feature, padded_d);
                 wmma::mma_sync(scores, a, b, scores);
             }
-            // Explicit row-major layout avoids assuming a WMMA fragment's
-            // element-to-lane mapping for row reductions and rescaling.
+            
             wmma::store_matrix_sync(weights + warp_key_begin, scores, kBlockN,
                                     wmma::mem_row_major);
         }
@@ -84,8 +81,7 @@ __global__ void fused_fp16_attention(const __half* Q, const __half* K, const __h
                 ? weights[local_query * kBlockN + key] * score_scale : -CUDART_INF_F;
             tile_maximum = fmaxf(tile_maximum, row_scores[slot]);
         }
-        // Every lane participates, including padded query rows. Width confines
-        // each all-reduce to one four-thread row group within its warp.
+        
         #pragma unroll
         for (int offset = kFusedRowThreads / 2; offset > 0; offset /= 2) {
             tile_maximum = fmaxf(tile_maximum,
@@ -93,14 +89,12 @@ __global__ void fused_fp16_attention(const __half* Q, const __half* K, const __h
         }
         const bool has_values = tile_maximum != -CUDART_INF_F;
         const float next_maximum = fmaxf(running_maximum, tile_maximum);
-        // Padded rows have no legal logits: avoid exp(-inf - -inf).
         const float alpha = has_values ? expf(running_maximum - next_maximum) : 1.0f;
         float tile_sum = 0.0f;
         #pragma unroll
         for (int slot = 0; slot < kScoreSlots; ++slot) {
             const int key = row_lane + slot * kFusedRowThreads;
             const float p = has_values ? expf(row_scores[slot] - next_maximum) : 0.0f;
-            // Each thread overwrites only the score positions it has read.
             weights[local_query * kBlockN + key] = p;
             tile_sum += p;
         }
@@ -127,7 +121,6 @@ __global__ void fused_fp16_attention(const __half* Q, const __half* K, const __h
                 }
             }
         }
-        // All weight/V reads finish before either shared region is reused.
         __syncthreads();
     }
 
